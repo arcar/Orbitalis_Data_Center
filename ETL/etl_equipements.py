@@ -2,13 +2,13 @@ import pandas as pd
 from pathlib import Path
 import sqlite3
 
-CSV_PATH = "data/raw/maintenance.csv"
-OUTPUT_PATH = "data/maintenance_propre.csv"
-EQUIP_PATH = "data/raw/equipements.csv"
+CSV_PATH = "data/raw/equipements.csv"
+OUTPUT_PATH = "data/equipements_propre.csv"
+SITE_PATH = "data/raw/sites.csv"
 SQL_DB = "data/raw/catalogue.db"
 dossier_sortie = Path("data/lignes_rejetees")
 dossier_sortie.mkdir(parents=True, exist_ok=True)
-REJETS_PATH = "maintenance_lignes_rejetees.csv"
+REJETS_PATH = "equipements_lignes_rejetees.csv"
 
 
 
@@ -30,7 +30,90 @@ def nettoyage_csv(df):
     print(f"\nTotal valeurs manquantes : {valeurs_manquantes}\n")
 
 
-    print("\n3 : Vérification et suppression doublons")
+    print("\n3 : Modification format et coherence date")
+    print("-" * 40)
+    df["date_installation"] = pd.to_datetime(df["date_installation"], format="mixed", errors="coerce")
+    df["date_installation"] = pd.to_datetime(df["date_installation"], format="ISO8601", utc=True, errors="coerce")
+    
+    # Dates manquantes ou invalides (NaT après conversion)
+    idx_manquantes = df[df["date_installation"].isna()].index
+    manquantes = df["date_installation"].isna()
+    df_rejets_date_manquante = df[manquantes].copy()
+    df_rejets_date_manquante["motif_rejet"] = "date manquante"
+    print(len(idx_manquantes), "ligne(s) date manquante(s) supprimée(s)")
+    df = df.drop(index=idx_manquantes)
+
+    # Date dans le futur
+    maintenant = pd.Timestamp.now(tz="UTC")
+    futures = df[df["date_installation"] > maintenant].index
+    futur_rejet = df["date_installation"] > maintenant
+    df_rejets_date_futur = df[futur_rejet].copy()
+    df_rejets_date_futur["motif_rejet"] = "date dans le futur"
+    print(len(futures), "lignes date futur")
+    df = df.drop(index=futures)
+
+    
+    print("\n4 : Suppression sans id_equipement valide")
+    print("-" * 40)
+    avant = len(df)
+    id_equ = df["equipement_id"].str.match(r"^EQ-\d+$", case=False, na=False)
+    df_rejets_id_eq = df[~id_equ].copy()
+    df_rejets_id_eq["motif_rejet"] = "id_equipement invalide"
+    df = df[id_equ].copy()
+    apres = len(df)
+    print((avant - apres), "ligne(s) supprimée(s) car Id_Equipement incorrect")
+
+
+    print("\n5 : Valeurs puissance nominale négatives")
+    print("-" * 40)
+    puiss_negatif = df["puissance_nominale_w"] < 0
+    print("nombre de valeurs négatives avant traitement :", (df["puissance_nominale_w"] < 0).sum())
+    # Médiane de puissance_nominale_w, calculée par valeur de type (hors négatifs)
+    mediane_par_type = (df.loc[~puiss_negatif].groupby("type")["puissance_nominale_w"].median())
+    df.loc[puiss_negatif, "puissance_nominale_w"] = df.loc[puiss_negatif, "type"].map(mediane_par_type)   
+    print("nombre de valeurs négatives apres traitement :", (df["puissance_nominale_w"] < 0).sum())
+
+
+    # Modification des valeurs de "id_site"  pour s'assurer que l'on a les mêmes equipements que le fichier sites.csv
+    print("\n6 : Cohérence id_site avec fichier sites.csv")
+    print("-" * 40)
+    nb_lignes_avant = len(df)
+    print(f"Nombre de données : {nb_lignes_avant}")
+    data_equip = pd.read_csv(SITE_PATH)
+    ids_equipement = set(df["site_id"].dropna())
+    ids_site = set(data_equip["site_id"].dropna())
+    ids_inconnus = ids_equipement - ids_site
+    lignes_inconnues = df[df["site_id"].isin(ids_inconnus)]
+    if ids_inconnus:
+        print("ERREUR : certains equipement_id de maintenance.csv n'existent pas dans sites.csv.")
+        print("IDs inconnus :", sorted(ids_inconnus))
+        # Nombre de lignes concernées par chaque equipement_id inconnu        
+        print("Nombre de lignes par site_id inconnu :", lignes_inconnues["site_id"].value_counts())
+        # Suppression des lignes
+        nb_avant = len(df)
+        id_equip_rejet = df["site_id"].isin(ids_inconnus)
+        df_rejets_id_site = df[id_equip_rejet].copy()
+        df_rejets_id_site["motif_rejet"] = "site_id inexistant"
+        df = df[~df["site_id"].isin(ids_inconnus)]
+        nb_supprimees = nb_avant - len(df)
+        print(f"Nombre total de lignes supprimées : {nb_supprimees}")
+    else:
+        print("OK : tous les site_id de equipements.csv existent dans sites.csv.")
+        df_rejets_id_site = df.iloc[0:0].copy()   # DataFrame vide avec les mêmes colonnes
+        df_rejets_id_site["motif_rejet"] = pd.Series(dtype="object")
+    
+    nb_lignes_apres = len(df)
+    print(f"Nombre de données après nettoyage - site_id - : {nb_lignes_apres}")
+
+
+    print("\n7 : Supprimer equipement sans site")
+    print("-" * 40)
+    siteId_vide = df["site_id"].isna() | (df["site_id"].astype(str).str.strip() == "")
+    df_rejets_vide = df[siteId_vide].copy()
+    df_rejets_vide["motif_rejet"] = "siteId vide"
+    df = df[~siteId_vide].copy()
+
+    print("\n8 : Vérification et suppression doublons")
     print("-" * 40)
     nb_lignes_avant = len(df)
     print(f"\nNombre de données : {nb_lignes_avant}")
@@ -45,98 +128,10 @@ def nettoyage_csv(df):
         print(f"\nDoublons supprimés, nouveau nombre de données : {nb_lignes_apres}\n")
     else : 
         nb_lignes_apres = len(df)
-        
-
-
-    print("\n4 : Modification format et coherence date")
-    print("-" * 40)
-    df["date_debut"] = pd.to_datetime(df["date_debut"], format="mixed", errors="coerce")
-    df["date_fin"] = pd.to_datetime(df["date_fin"], format="mixed", errors="coerce")
-    df["date_debut"] = pd.to_datetime(df["date_debut"], format="ISO8601", utc=True, errors="coerce")
-    df["date_fin"] = pd.to_datetime(df["date_fin"], format="ISO8601", utc=True, errors="coerce")
-
-    # Lignes incohérentes : fin avant début
-    idx_incoherentes = df[df["date_fin"] < df["date_debut"]].index
-    incoherentes = df["date_fin"] < df["date_debut"]
-    df_rejets_date_incoherente = df[incoherentes].copy()
-    df_rejets_date_incoherente["motif_rejet"] = "date incoherente"
-    
-    print(len(idx_incoherentes), "ligne(s) date incohérente(s) supprimée(s)")
-    df = df.drop(index=idx_incoherentes)
-
-    # Dates manquantes ou invalides (NaT après conversion)
-    idx_manquantes = df[df["date_debut"].isna() | df["date_fin"].isna()].index
-    manquantes = df["date_debut"].isna() | df["date_fin"].isna()
-    df_rejets_date_manquante = df[manquantes].copy()
-    df_rejets_date_manquante["motif_rejet"] = "date manquante"
-    print(len(idx_manquantes), "ligne(s) date manquante(s) supprimée(s)")
-    df = df.drop(index=idx_manquantes)
-
-    # Date dans le futur
-    maintenant = pd.Timestamp.now(tz="UTC")
-    futures = df[df["date_debut"] > maintenant].index
-    futur_rejet = df["date_debut"] > maintenant
-    df_rejets_date_futur = df[futur_rejet].copy()
-    df_rejets_date_futur["motif_rejet"] = "date dans le futur"
-    print(len(futures), "lignes date futur")
-    df = df.drop(index=futures)
-
-    
-    print("\n5 : Suppression sans id_equipement valide")
-    print("-" * 40)
-    avant = len(df)
-    id_equ = df["equipement_id"].str.match(r"^EQ-\d+$", case=False, na=False)
-    df_rejets_id_eq = df[~id_equ].copy()
-    df_rejets_id_eq["motif_rejet"] = "id_equipement invalide"
-    df = df[id_equ].copy()
-    apres = len(df)
-    print((avant - apres), "ligne(s) supprimée(s) car Id_Equipement incorrect")
-
-
-    print("\n6 : Valeurs cout_eur négatives")
-    print("-" * 40)
-    cout_negatif = df["cout_eur"] < 0
-    print("nombre de valeurs négatives avant traitement :", (df["cout_eur"] < 0).sum())
-    # Médiane de cout_eur, calculée par valeur d'intervention (hors négatifs)
-    mediane_par_intervention = (df.loc[~cout_negatif].groupby("type_intervention")["cout_eur"].median())
-    df.loc[cout_negatif, "cout_eur"] = df.loc[cout_negatif, "type_intervention"].map(mediane_par_intervention)   
-    print("nombre de valeurs négatives apres traitement :", (df["cout_eur"] < 0).sum())
-
-
-    # Modification des valeurs de "equipement_id"  pour s'assurer que l'on a les mêmes equipements que le fichier equipements.csv
-    print("\n7 : Cohérence id_equipement avec fichier equipements.csv")
-    print("-" * 40)
-    nb_lignes_avant = len(df)
-    print(f"Nombre de données : {nb_lignes_avant}")
-    data_equip = pd.read_csv(EQUIP_PATH)
-    ids_maintenance = set(df["equipement_id"].dropna())
-    ids_equipement = set(data_equip["equipement_id"].dropna())
-    ids_inconnus = ids_maintenance - ids_equipement
-    lignes_inconnues = df[df["equipement_id"].isin(ids_inconnus)]
-    if ids_inconnus:
-        print("ERREUR : certains equipement_id de maintenance.csv n'existent pas dans equipements.csv.")
-        print("IDs inconnus :", sorted(ids_inconnus))
-        # Nombre de lignes concernées par chaque equipement_id inconnu        
-        print("Nombre de lignes par equipement_id inconnu :", lignes_inconnues["equipement_id"].value_counts())
-        # Suppression des lignes
-        nb_avant = len(df)
-        id_equip_rejet = df["equipement_id"].isin(ids_inconnus)
-        df_rejets_id_equip = df[id_equip_rejet].copy()
-        df_rejets_id_equip["motif_rejet"] = "equipement_id inexistant"
-        df = df[~df["equipement_id"].isin(ids_inconnus)]
-        nb_supprimees = nb_avant - len(df)
-        print(f"Nombre total de lignes supprimées : {nb_supprimees}")
-    else:
-        print("OK : tous les equipement_id de maintenance.csv existent dans equipements.csv.")
-        df_rejets_id_equip = df.iloc[0:0].copy()   # DataFrame vide avec les mêmes colonnes
-        df_rejets_id_equip["motif_rejet"] = pd.Series(dtype="object")
-    
-    nb_lignes_apres = len(df)
-    print(f"Nombre de données après nettoyage - equipement_id - : {nb_lignes_apres}")
 
 
 
-    df_rejets_total = pd.concat([df_rejets_doublons, df_rejets_date_incoherente, df_rejets_date_manquante, df_rejets_date_futur,df_rejets_id_eq, df_rejets_id_equip], ignore_index=True)
+    df_rejets_total = pd.concat([df_rejets_doublons, df_rejets_vide, df_rejets_date_manquante, df_rejets_date_futur,df_rejets_id_eq, df_rejets_id_site], ignore_index=True)
     df_rejets_total.to_csv(dossier_sortie / REJETS_PATH, index=False)
 
 
