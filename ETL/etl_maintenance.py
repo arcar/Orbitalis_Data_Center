@@ -33,12 +33,16 @@ def nettoyage_csv(df):
     print(f"\nNombre de données : {nb_lignes_avant}")
     doublons_count = df.duplicated().sum()
     print(f"\nNombre de doublons : {doublons_count}")
+    doublons = df.duplicated
+    df_rejets_doublons = df[doublons].copy()
+    df_rejets_doublons["motif_rejet"] = "doublon"
     if doublons_count > 0:
         df = df.drop_duplicates()
         nb_lignes_apres = len(df)
         print(f"\nDoublons supprimés, nouveau nombre de données : {nb_lignes_apres}\n")
     else : 
         nb_lignes_apres = len(df)
+        
 
 
     print("\n4 : Modification format et coherence date")
@@ -51,26 +55,36 @@ def nettoyage_csv(df):
     # Lignes incohérentes : fin avant début
     idx_incoherentes = df[df["date_fin"] < df["date_debut"]].index
     incoherentes = df["date_fin"] < df["date_debut"]
-    df_rejets = df[incoherentes].copy()
-    df_rejets.to_csv(dossier_sortie /REJETS_PATH, index = False)
+    df_rejets_date_incoherente = df[incoherentes].copy()
+    df_rejets_date_incoherente["motif_rejet"] = "date incoherente"
+    
     print(len(idx_incoherentes), "ligne(s) date incohérente(s) supprimée(s)")
     df = df.drop(index=idx_incoherentes)
 
     # Dates manquantes ou invalides (NaT après conversion)
-    manquantes = df[df["date_debut"].isna() | df["date_fin"].isna()].index
-    print(len(manquantes), "ligne(s) date manquante(s) supprimée(s)")
-    df = df.drop(index=manquantes)
+    idx_manquantes = df[df["date_debut"].isna() | df["date_fin"].isna()].index
+    manquantes = df["date_debut"].isna() | df["date_fin"].isna()
+    df_rejets_date_manquante = df[manquantes].copy()
+    df_rejets_date_manquante["motif_rejet"] = "date manquante"
+    print(len(idx_manquantes), "ligne(s) date manquante(s) supprimée(s)")
+    df = df.drop(index=idx_manquantes)
 
     # Date dans le futur
     maintenant = pd.Timestamp.now(tz="UTC")
-    futures = df[df["date_debut"] > maintenant]
+    futures = df[df["date_debut"] > maintenant].index
+    futur_rejet = df["date_debut"] > maintenant
+    df_rejets_date_futur = df[futur_rejet].copy()
+    df_rejets_date_futur["motif_rejet"] = "date dans le futur"
     print(len(futures), "lignes date futur")
+    df = df.drop(index=futures)
 
     
     print("\n5 : Suppression sans id_equipement valide")
     print("-" * 40)
     avant = len(df)
     id_equ = df["equipement_id"].str.match(r"^EQ-\d+$", case=False, na=False)
+    df_rejets_id_eq = df[~id_equ].copy()
+    df_rejets_id_eq["motif_rejet"] = "id_equipement invalide"
     df = df[id_equ].copy()
     apres = len(df)
     print((avant - apres), "ligne(s) supprimée(s) car Id_Equipement incorrect")
@@ -84,6 +98,10 @@ def nettoyage_csv(df):
     df.loc[cout_negatif, "cout_eur"] = df.loc[cout_negatif, "type_intervention"].map(mediane_par_intervention)   
     print("nombre de valeurs négatives apres traitement :", (df["cout_eur"] < 0).sum())
 
+
+
+    df_rejets_total = pd.concat([df_rejets_doublons, df_rejets_date_incoherente, df_rejets_date_manquante, df_rejets_date_futur,df_rejets_id_eq], ignore_index=True)
+    df_rejets_total.to_csv(dossier_sortie / REJETS_PATH, index=False)
 
 
     df.to_csv(OUTPUT_PATH, index=False)
