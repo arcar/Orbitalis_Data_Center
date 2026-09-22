@@ -1,0 +1,2 @@
+maintenance_id,equipement_id,date_debut,date_fin,type_intervention,technicien,cout_eur,commentaire
+MAINT-000,,2025-05-01 00:00:00+00:00,2025-04-28 00:00:00+00:00,???,,0,Données incohérentes

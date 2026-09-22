@@ -1,10 +1,13 @@
 import pandas as pd
+from pathlib import Path
 import sqlite3
 
 CSV_PATH = "data/raw/maintenance.csv"
 OUTPUT_PATH = "data/maintenance_propre.csv"
-REJETS_PATH = "data/lignes_rejetees/maintenance_lignes_rejetees.csv"
 SQL_DB = "data/raw/catalogue.db"
+dossier_sortie = Path("data/lignes_rejetees")
+dossier_sortie.mkdir(parents=True, exist_ok=True)
+REJETS_PATH = "maintenance_lignes_rejetees.csv"
 
 
 
@@ -49,7 +52,7 @@ def nettoyage_csv(df):
     idx_incoherentes = df[df["date_fin"] < df["date_debut"]].index
     incoherentes = df["date_fin"] < df["date_debut"]
     df_rejets = df[incoherentes].copy()
-    df_rejets.to_csv(REJETS_PATH, index = False)
+    df_rejets.to_csv(dossier_sortie /REJETS_PATH, index = False)
     print(len(idx_incoherentes), "ligne(s) date incohérente(s) supprimée(s)")
     df = df.drop(index=idx_incoherentes)
 
@@ -81,15 +84,6 @@ def nettoyage_csv(df):
     df.loc[cout_negatif, "cout_eur"] = df.loc[cout_negatif, "type_intervention"].map(mediane_par_intervention)   
     print("nombre de valeurs négatives apres traitement :", (df["cout_eur"] < 0).sum())
 
-
-
-    # print("5 : Ne conserver que les données Solaire")
-    # print("-" * 40)
-    # df = df[~df["Source"].str.contains("Wind", case=False, na=False)]
-
-    # print("5 : Supprimer colonne Source")
-    # print("-" * 40)
-    # df = df.drop("Source", axis=1)
 
 
     df.to_csv(OUTPUT_PATH, index=False)
