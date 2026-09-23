@@ -4,7 +4,7 @@ import sqlite3
 
 CSV_PATH = "data/raw/maintenance.csv"
 OUTPUT_PATH = "data/maintenance_propre.csv"
-EQUIP_PATH = "data/raw/equipements.csv"
+EQUIP_PATH = "data/equipements_propre.csv"
 SQL_DB = "data/raw/catalogue.db"
 dossier_sortie = Path("data/lignes_rejetees")
 dossier_sortie.mkdir(parents=True, exist_ok=True)
