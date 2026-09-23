@@ -53,6 +53,12 @@ Les valeurs manquantes et aberrantes ont été traitées de la manière suivante
 ### Données en doublon
 Les doublons ont été retirés dans tous les fichiers sources.
 
+### Données alarmes.json
+#### Données manquantes
+Les données manquantes concernant l'ID des équipements ont été remplies par l'ID présent dans le message d'alarme lorsqu'il était présent. Si après traitement l'ID est toujours manquant la ligne est rejetée.
+#### Données aberrantes
+Les types d'alarmes ont été vérifiée. Si un type après traitement est identifié comme UNKNOWN_TYPE celui-ci est remplacé par la valeur présente dans le message d'alarme. Si malgré cette vérification le type est toujours inconnu, la ligne est rejeté.
+
 ### Données orbite.csv
 #### Données manquantes
 Les données manquantes de la température ont été remplacées par la médiane du cycle en cours (ensoleillement, eclipse)
