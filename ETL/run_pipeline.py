@@ -4,7 +4,7 @@ import etl_telemetrie
 import etl_equipements
 import etl_orbite
 import etl_catalog
-# import etl_alarme
+import etl_alarme
 
 def main():
     etl_sites.main()
@@ -13,7 +13,7 @@ def main():
     etl_telemetrie.main()
     etl_orbite.main()
     etl_catalog.main()
-    # etl_alarm.main()
+    etl_alarme.main()
 
 if __name__ == "__main__":
     main()
