@@ -135,6 +135,10 @@ def nettoyage_csv(df):
     df_rejets_total.to_csv(dossier_sortie / REJETS_PATH, index=False)
 
 
+    print("\n9 : Renommage des colonnes")
+    print("-" * 40)
+    df = df.rename(columns={"type": "type_equipement", "modele": "modele_id",})
+
     df.to_csv(OUTPUT_PATH, index=False)
     print(f"\nFichier nettoyé : '{OUTPUT_PATH}'")
     print(f"\nFichier lignes rejetées généré : '{REJETS_PATH}'")
