@@ -62,14 +62,8 @@ def nettoyage_csv(df):
     df_ref = pd.read_sql("SELECT site_id, zone_orbitale FROM references_sites", conn)
     conn.close()
     # Extrait le nombre juste avant "km" : "LEO-SSO 550km" -> 550.0
-    df_ref["altitude_km_ref"] = (
-        df_ref["zone_orbitale"]
-        .str.extract(r"(\d+(?:\.\d+)?)\s*km", expand=False)
-        .astype(float)
-    )
-
+    df_ref["altitude_km_ref"] = (df_ref["zone_orbitale"].str.extract(r"(\d+(?:\.\d+)?)\s*km", expand=False).astype(float))
     df = df.merge(df_ref[["site_id", "altitude_km_ref"]], on="site_id", how="left")
-
     # On ne remplace que les cases vides d'altitude_km
     df["altitude_km"] = df["altitude_km"].fillna(df["altitude_km_ref"])
     df = df.drop(columns=["altitude_km_ref"])
@@ -79,7 +73,6 @@ def nettoyage_csv(df):
         print(encore_vide[["site_id", "nom"]])
     else:
         print("OK : toutes les altitudes ont été complétées.")
-    
     print(df[["site_id", "nom", "altitude_km"]])
 
 
