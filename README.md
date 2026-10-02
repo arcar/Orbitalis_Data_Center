@@ -106,11 +106,11 @@ Toutes les lignes rejetées sont conservées dans une zone dédiée avec la rais
 ## Modèle de données
 ### Modèle relationnel
 
-![Texte alternatif](matrice_conceptuelle.png)
+<img src="images/matrice_conceptuelle.png" width="300" alt="Modèle de base de données relationnelle">
 
 ### Modèle décisionnel (en étoile)
 
-![Texte alternatif](matrice_decisionnelle.png)
+<img src="images/matrice_decisionnelle.png" width="300" alt="Modèle de base de données decisionnelle">
 
 
 ## Analyses SQL
