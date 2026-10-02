@@ -4,9 +4,8 @@ ORBITALIS est un projet de traitement, d'analyse et de valorisation de données 
 
 L'alimentation électrique du datacenter repose sur des panneaux solaires ainsi que sur plusieurs équipements de conversion et de stockage. Ces équipements sont soumis à des conditions particulières : alternance entre périodes d'ensoleillement et d'éclipse, variations importantes de température, rayonnement, vieillissement et risques de défaillance des capteurs ou convertisseurs.
 
-L'objectif est de construire une chaîne Data robuste, reproductible et exploitable permettant de fiabiliser les données, analyser les performances des équipements et anticiper les dégradations avant qu'elles n'aient un impact significatif sur la production.
+L'objectif du projet est de construire une chaîne Data robuste, reproductible et exploitable permettant de fiabiliser les données, analyser les performances des équipements et anticiper les dégradations avant qu'elles n'aient un impact significatif sur la production.
 
-## Objectifs
 Le projet couvre l'ensemble de la chaîne de traitement de la donnée :
 - Explorer et comprendre les différentes sources de données.
 - Identifier les problèmes de qualité et les incohérences.
@@ -23,12 +22,7 @@ Le projet couvre l'ensemble de la chaîne de traitement de la donnée :
 - Construire un modèle de maintenance prédictive.
 - Optimiser le modèle selon un coût métier des erreurs de prédiction.
 
-## Problématique
-La problématique principale du projet est la suivante :
-```Comment exploiter des données hétérogènes et imparfaites afin de surveiller la performance des équipements d'un datacenter orbital et d'anticiper les dégradations suffisamment tôt pour permettre une intervention de maintenance ?```
-
-
-## Sources de données
+## Sources de données utilisées
 Le projet utilise plusieurs sources provenant de systèmes différents :
 
 | Source	| Format | Description |
@@ -41,9 +35,43 @@ Le projet utilise plusieurs sources provenant de systèmes différents :
 | orbite.csv | CSV | Phases orbitales et contexte d'ensoleillement |
 | catalogue.db | SQLite | Données de référence complémentaires |
 
+## Technologies utilisées
+Le projet s'appuie notamment sur :
+- Python pour l'ingestion, le nettoyage et la modélisation
+- Pandas / NumPy pour la manipulation des données
+- SQLite pour le stockage et les analyses
+- Scikit-learn pour la maintenance prédictive
+- Matplotlib / Seaborn pour la visualisation
+
 ## Architecture du pipeline
 Le traitement des données repose sur une architecture en trois couches :
 
+                      ┌───────────┐
+                      │  SOURCES  │
+                      │  Données  │
+                      │  brutes   │
+                      └─────┬─────┘
+                            │
+                            │ ETL
+                            ▼
+                    ┌───────────────┐
+                    │    CLEANED    │
+                    │    Données    │
+                    │   nettoyées   │
+                    └───────┬───────┘
+                            │
+                            │ Modélisation
+                            │
+              ┌─────────────┴───────────┐
+              ▼                         ▼       
+       ┌───────────────┐       ┌───────────────┐
+       │  BASE VERITE  │       │   ANALYTICS   │
+       │    Modèle     │       │    Modèle     │
+       │   relationel  │       │    étoile     │
+       └───────────────┘       └───────────────┘
+                                        │
+                                        ▼       
+                                Machine Learning
 
 
 Cette architecture permet de conserver les données originales tout en assurant la traçabilité des transformations.
@@ -76,23 +104,16 @@ Toutes les lignes rejetées sont conservées dans une zone dédiée avec la rais
 
 
 ## Modèle de données
+### Modèle relationnel
+
+![Texte alternatif](matrice_conceptuelle.png)
+
+### Modèle décisionnel (en étoile)
+
+![Texte alternatif](matrice_decisionnelle.png)
 
 
 ## Analyses SQL
 
 
 ## Maintenance prédictive
-
-
-## Technologies utilisées
-Le projet s'appuie notamment sur :
-- Python pour l'ingestion, le nettoyage et la modélisation
-- Pandas / NumPy pour la manipulation des données
-- SQLite pour le stockage et les analyses
-- Scikit-learn pour la maintenance prédictive
-- Matplotlib / Seaborn pour la visualisation ;
-
-# Reproductibilité
-L'ensemble du pipeline est conçu pour être reproductible.
-
-Les transformations sont documentées et séparées des données sources. Les paramètres importants, les règles de qualité, les critères de rejet et les définitions des indicateurs sont explicités afin qu'une nouvelle exécution du pipeline puisse produire les mêmes résultats à partir des mêmes données d'entrée.
