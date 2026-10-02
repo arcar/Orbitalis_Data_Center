@@ -2,7 +2,7 @@ import pandas as pd
 from pathlib import Path
 
 CSV_PATH = "data/raw/orbite.csv"
-SITE_PATH = "data/raw/sites.csv"
+SITE_PATH = "data/sites_propre.csv"
 
 OUTPUT_PATH = "data/orbite_propre.csv"
 

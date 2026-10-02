@@ -6,7 +6,7 @@ from datetime import timezone
 
 CSV_PATH = "data/raw/telemetrie.csv"
 OUTPUT_PATH = "data/telemetrie_propre.csv"
-EQUI_PATH = "data/raw/equipements.csv"
+EQUI_PATH = "data/equipements_propre.csv"
 SQL_DB = "data/raw/catalogue.db"
 dossier_sortie = Path("data/lignes_rejetees")
 dossier_sortie.mkdir(parents=True, exist_ok=True)
