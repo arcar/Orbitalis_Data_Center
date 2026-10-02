@@ -59,11 +59,11 @@ def nettoyage_csv(df):
     cursor.execute("PRAGMA table_info(references_sites)")
     for col in cursor.fetchall():
         print(col)
-    df_ref = pd.read_sql("SELECT site_id, zone_orbitale FROM references_sites", conn)
+    df_ref = pd.read_sql("SELECT * FROM references_sites", conn)
     conn.close()
     # Extrait le nombre juste avant "km" : "LEO-SSO 550km" -> 550.0
     df_ref["altitude_km_ref"] = (df_ref["zone_orbitale"].str.extract(r"(\d+(?:\.\d+)?)\s*km", expand=False).astype(float))
-    df = df.merge(df_ref[["site_id", "altitude_km_ref"]], on="site_id", how="left")
+    df = df.merge(df_ref[["site_id", "altitude_km_ref", "description", "capacite_max_kw"]], on="site_id", how="left")
     # On ne remplace que les cases vides d'altitude_km
     df["altitude_km"] = df["altitude_km"].fillna(df["altitude_km_ref"])
     df = df.drop(columns=["altitude_km_ref"])
@@ -83,7 +83,7 @@ def nettoyage_csv(df):
     print(f"\nNombre de données : {nb_lignes_avant}")
     doublons_count = df.duplicated().sum()
     print(f"\nNombre de doublons : {doublons_count}")
-    doublons = df.duplicated
+    doublons = df.duplicated()
     df_rejets_doublons = df[doublons].copy()
     df_rejets_doublons["motif_rejet"] = "doublon"
     if doublons_count > 0:
@@ -173,6 +173,7 @@ def nettoyage_csv(df):
 def main():
     df = lire_csv()
     df = nettoyage_csv(df)
+    return df
     # creer_db()
     # alimenter_solaire(df)
     # executer_SQL()
