@@ -1,4 +1,5 @@
 from pathlib import Path
+import pandas as pd
 import sqlite3 
 
 import etl_maintenance
@@ -10,13 +11,14 @@ import etl_catalog
 import etl_alarme
 
 SQLITE_PATH = Path("./data/base_analytique.db")
+SQL_DB = "data/raw/catalogue.db"
 
 def creer_base(cursor):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS modele(
             modele_id              TEXT PRIMARY KEY,
             type_equipement        TEXT,
-            fabriquant             TEXT,
+            fabricant              TEXT,
             puissance_nominale_w   INTEGER,
             rendement_nominal      REAL,
             duree_vie_annee        INTEGER,
@@ -120,7 +122,7 @@ def creer_base(cursor):
             )
         """)
 
-def charger_base(site):
+def charger_base(modele, site):
     # Crée le dossier ./data s'il n'existe pas
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -132,7 +134,31 @@ def charger_base(site):
         # Création des tables
         creer_base(cursor)
 
-        # Insertion des données de site
+        # Insertion des données de la table "modele"
+        for _, modele in modele.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO modele (
+                    modele_id,
+                    type_equipement,
+                    fabricant,
+                    puissance_nominale_w,
+                    rendement_nominal,
+                    duree_vie_annee,
+                    masse_kg)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    modele["modele_id"],
+                    modele["type_equipement"],
+                    modele["fabricant"],
+                    modele["puissance_nominale_w"],
+                    modele["rendement_nominal"],
+                    modele["duree_vie_annees"],
+                    modele["masse_kg"],
+                ),
+            )
+        # Insertion des données de la table "site"
         for _, site in site.iterrows():
             cursor.execute(
                 """
@@ -145,8 +171,7 @@ def charger_base(site):
                     date_mise_en_service,
                     statut,
                     description,
-                    capacite_max_kw
-                )
+                    capacite_max_kw )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -177,7 +202,10 @@ def main():
     etl_catalog.main()
     etl_alarme.main()
 
-    charger_base(site)
+    cnx = sqlite3.connect(SQL_DB)
+    modele = pd.read_sql("SELECT * FROM modeles", cnx)
+
+    charger_base(modele, site)
 
 if __name__ == "__main__":
     main()
