@@ -213,6 +213,7 @@ def nettoyage_csv(df):
 def main():
     df = lire_csv()
     df = nettoyage_csv(df)
+    return df
     # creer_db()
     # alimenter_solaire(df)
     # executer_SQL()

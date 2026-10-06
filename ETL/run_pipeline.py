@@ -122,7 +122,7 @@ def creer_base(cursor):
             )
         """)
 
-def charger_base(modele, site):
+def charger_base(modele, site, equipement):
     # Crée le dossier ./data s'il n'existe pas
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -187,6 +187,27 @@ def charger_base(modele, site):
                 ),
             )
 
+        # Insertion des données de la table "equipement"
+        for _, equipement in equipement.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO equipement (
+                    equipement_id,
+                    date_installation,
+                    statut,
+                    site_id,
+                    modele_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    equipement["equipement_id"],
+                    equipement["date_installation"].isoformat(),
+                    equipement["statut"],
+                    equipement["site_id"],
+                    equipement["modele_id"],
+                ),
+            )
+
         conn.commit()
 
     finally:
@@ -195,7 +216,7 @@ def charger_base(modele, site):
 
 def main():
     site = etl_sites.main()
-    etl_equipements.main()
+    equipement = etl_equipements.main()
     etl_maintenance.main()
     etl_telemetrie.main()
     etl_orbite.main()
@@ -205,7 +226,7 @@ def main():
     cnx = sqlite3.connect(SQL_DB)
     modele = pd.read_sql("SELECT * FROM modeles", cnx)
 
-    charger_base(modele, site)
+    charger_base(modele, site, equipement)
 
 if __name__ == "__main__":
     main()
