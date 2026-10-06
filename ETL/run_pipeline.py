@@ -55,7 +55,7 @@ def creer_base(cursor):
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS type_alarme(
-            type_alarme_id              TEXT PRIMARY KEY,
+            type_alarme_id              INTEGER PRIMARY KEY AUTOINCREMENT,
             type_alarme                 TEXT,
             seuil_warning               REAL,
             seuil_critical              REAL,
@@ -122,7 +122,7 @@ def creer_base(cursor):
             )
         """)
 
-def charger_base(modele, site, mesures_orbite, equipement):
+def charger_base(modele, site, mesures_orbite, type_alarme, equipement):
     # Crée le dossier ./data s'il n'existe pas
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -135,7 +135,7 @@ def charger_base(modele, site, mesures_orbite, equipement):
         creer_base(cursor)
 
         # Insertion des données de la table "modele"
-        for _, modele in modele.iterrows():
+        for _, row in modele.iterrows():
             cursor.execute(
                 """
                 INSERT INTO modele (
@@ -187,7 +187,7 @@ def charger_base(modele, site, mesures_orbite, equipement):
                 ),
             )
 
-        # Insertion des données de la table "equipement"
+        # Insertion des données de la table "mesures_orbite"
         for _, row in mesures_orbite.iterrows():
             cursor.execute(
                 """
@@ -207,6 +207,27 @@ def charger_base(modele, site, mesures_orbite, equipement):
                     row["site_id"],
                 ),
             )
+
+        # Insertion des données de la table "type_alarme"
+        for _, row in type_alarme.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO type_alarme (
+                    type_alarme,
+                    seuil_warning,
+                    seuil_critical,
+                    unite,
+                    description)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    row["type_alarme"],
+                    row["seuil_warning"],
+                    row["seuil_critical"],
+                    row["unite"],
+                    row["description"],
+                ),
+            )  
 
         # Insertion des données de la table "equipement"
         for _, row in equipement.iterrows():
@@ -246,8 +267,9 @@ def main():
 
     cnx = sqlite3.connect(SQL_DB)
     modele = pd.read_sql("SELECT * FROM modeles", cnx)
+    type_alarme = pd.read_sql("SELECT * FROM seuils_alarmes", cnx)
 
-    charger_base(modele, site, mesures_orbite, equipement)
+    charger_base(modele, site, mesures_orbite, type_alarme, equipement)
 
 if __name__ == "__main__":
     main()
