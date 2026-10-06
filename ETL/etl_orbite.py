@@ -250,6 +250,7 @@ def nettoyage_csv(df):
 def main():
     df = lire_csv()
     df = nettoyage_csv(df)
+    return df
 
 
 if __name__ == "__main__":

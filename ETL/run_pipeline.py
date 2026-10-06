@@ -42,7 +42,7 @@ def creer_base(cursor):
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS mesures_orbite(
-            mesure_id                   INTEGER PRIMARY KEY,
+            mesure_id                   INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_orbite            TEXT,
             phase                       TEXT,
             rayonnement_solaire_w_m2    REAL,
@@ -122,7 +122,7 @@ def creer_base(cursor):
             )
         """)
 
-def charger_base(modele, site, equipement):
+def charger_base(modele, site, mesures_orbite, equipement):
     # Crée le dossier ./data s'il n'existe pas
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -149,17 +149,17 @@ def charger_base(modele, site, equipement):
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
                 (
-                    modele["modele_id"],
-                    modele["type_equipement"],
-                    modele["fabricant"],
-                    modele["puissance_nominale_w"],
-                    modele["rendement_nominal"],
-                    modele["duree_vie_annees"],
-                    modele["masse_kg"],
+                    row["modele_id"],
+                    row["type_equipement"],
+                    row["fabricant"],
+                    row["puissance_nominale_w"],
+                    row["rendement_nominal"],
+                    row["duree_vie_annees"],
+                    row["masse_kg"],
                 ),
             )
         # Insertion des données de la table "site"
-        for _, site in site.iterrows():
+        for _, row in site.iterrows():
             cursor.execute(
                 """
                 INSERT INTO site (
@@ -175,20 +175,41 @@ def charger_base(modele, site, equipement):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    site["site_id"],
-                    site["nom"],
-                    site["orbite_type"],
-                    site["altitude_km"],
-                    site["inclination_deg"],
-                    site["date_mise_en_service"].isoformat(),
-                    site["statut"],
-                    site["description"],
-                    site["capacite_max_kw"],
+                    row["site_id"],
+                    row["nom"],
+                    row["orbite_type"],
+                    row["altitude_km"],
+                    row["inclination_deg"],
+                    row["date_mise_en_service"].isoformat(),
+                    row["statut"],
+                    row["description"],
+                    row["capacite_max_kw"],
                 ),
             )
 
         # Insertion des données de la table "equipement"
-        for _, equipement in equipement.iterrows():
+        for _, row in mesures_orbite.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO mesures_orbite (
+                    timestamp_orbite,
+                    phase,
+                    rayonnement_solaire_w_m2,
+                    temperature_ambiante_c,
+                    site_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    row["timestamp"].isoformat(),
+                    row["phase"],
+                    row["rayonnement_solaire_w_m2"],
+                    row["temperature_ambiante_c"],
+                    row["site_id"],
+                ),
+            )
+
+        # Insertion des données de la table "equipement"
+        for _, row in equipement.iterrows():
             cursor.execute(
                 """
                 INSERT INTO equipement (
@@ -200,11 +221,11 @@ def charger_base(modele, site, equipement):
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    equipement["equipement_id"],
-                    equipement["date_installation"].isoformat(),
-                    equipement["statut"],
-                    equipement["site_id"],
-                    equipement["modele_id"],
+                    row["equipement_id"],
+                    row["date_installation"].isoformat(),
+                    row["statut"],
+                    row["site_id"],
+                    row["modele_id"],
                 ),
             )
 
@@ -219,14 +240,14 @@ def main():
     equipement = etl_equipements.main()
     etl_maintenance.main()
     etl_telemetrie.main()
-    etl_orbite.main()
+    mesures_orbite = etl_orbite.main()
     etl_catalog.main()
     etl_alarme.main()
 
     cnx = sqlite3.connect(SQL_DB)
     modele = pd.read_sql("SELECT * FROM modeles", cnx)
 
-    charger_base(modele, site, equipement)
+    charger_base(modele, site, mesures_orbite, equipement)
 
 if __name__ == "__main__":
     main()
