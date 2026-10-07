@@ -191,6 +191,8 @@ def main():
     df = lire_db(nom_table)
    
     df = nettoyage_table(df)
+
+    return df
     
     # creer_db()
     # alimenter_solaire(df)

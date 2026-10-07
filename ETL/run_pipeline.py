@@ -108,7 +108,7 @@ def creer_base(cursor):
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS telemetrie(
-            telemetrie_id               TEXT PRIMARY KEY,
+            telemetrie_id               INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_telemetrie        TEXT,
             puissance_w                 REAL,
             temperature_c               REAL,
@@ -121,7 +121,7 @@ def creer_base(cursor):
             )
         """)
 
-def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance):
+def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance, telemetrie):
     # Crée le dossier ./data s'il n'existe pas
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -301,6 +301,31 @@ def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, 
                 ),
             )
 
+        # Insertion des données de la table "telemetrie"
+        for _, row in telemetrie.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO telemetrie (
+                    timestamp_telemetrie,
+                    puissance_w,
+                    temperature_c,
+                    rayonnement,
+                    tension_v,
+                    courant_a,
+                    equipement_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["timestamp"].isoformat(),
+                    row["puissance_w"],
+                    row["temperature_c"],
+                    row["rayonnement"],
+                    row["tension_v"],
+                    row["courant_a"],
+                    row["equipement_id"]
+                ),
+            )
+
         conn.commit()
 
     finally:
@@ -311,18 +336,16 @@ def main():
     site = etl_sites.main()
     equipement = etl_equipements.main()
     maintenance = etl_maintenance.main()
-    etl_telemetrie.main()
+    telemetrie = etl_telemetrie.main()
     mesures_orbite = etl_orbite.main()
-    etl_catalog.main()
+    modele = etl_catalog.main()
     alarme = etl_alarme.main()
 
     cnx = sqlite3.connect(SQL_DB)
-    modele = pd.read_sql("SELECT * FROM modeles", cnx)
     type_alarme = pd.read_sql("SELECT * FROM seuils_alarmes", cnx)
-
     cnx.close()
 
-    charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance)
+    charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance, telemetrie)
 
 if __name__ == "__main__":
     main()
