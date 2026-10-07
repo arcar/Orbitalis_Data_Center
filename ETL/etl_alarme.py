@@ -227,11 +227,14 @@ def nettoyage_json(df):
     print(f"Doublons : {len(df_rejets_doublons)}")
     print(f"Equipement inconnu : {len(df_rejets_equipement)}")
     print(f"Type d'alarme inconnu : {len(df_rejets_alarmes)}")
-    print(f"Nombre de lignes après nettoyage : {nb_lignes_apres_nettoyage}")    
+    print(f"Nombre de lignes après nettoyage : {nb_lignes_apres_nettoyage}")
+
+    return df   
 
 def main():
     df = lire_json()
     df = nettoyage_json(df)
+    return df
 
 
 if __name__ == "__main__":

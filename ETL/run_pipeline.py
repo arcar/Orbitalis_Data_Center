@@ -55,8 +55,7 @@ def creer_base(cursor):
     
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS type_alarme(
-            type_alarme_id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            type_alarme                 TEXT,
+            type_alarme_id              TEXT PRIMARY KEY,
             seuil_warning               REAL,
             seuil_critical              REAL,
             unite                       TEXT,
@@ -83,9 +82,9 @@ def creer_base(cursor):
             timestamp_alarme            TEXT,
             severite                    TEXT,
             message                     TEXT,
-            acquitee                    INTEGER,
+            acquittee                    INTEGER,
             equipement_id               TEXT NOT NULL,
-            type_alarme_id              TEXT NOT NULL,
+            type_alarme_id              INTEGER NOT NULL,
 
             FOREIGN KEY (equipement_id) REFERENCES Equipement (equipement_id),
             FOREIGN KEY (type_alarme_id) REFERENCES type_alarme (type_alarme_id)
@@ -122,7 +121,7 @@ def creer_base(cursor):
             )
         """)
 
-def charger_base(modele, site, mesures_orbite, type_alarme, equipement):
+def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme):
     # Crée le dossier ./data s'il n'existe pas
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -213,7 +212,7 @@ def charger_base(modele, site, mesures_orbite, type_alarme, equipement):
             cursor.execute(
                 """
                 INSERT INTO type_alarme (
-                    type_alarme,
+                    type_alarme_id,
                     seuil_warning,
                     seuil_critical,
                     unite,
@@ -250,6 +249,31 @@ def charger_base(modele, site, mesures_orbite, type_alarme, equipement):
                 ),
             )
 
+        # Insertion des données de la table "alarme"
+        for _, row in alarme.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO alarme (
+                    alarme_id,
+                    timestamp_alarme,
+                    severite,
+                    message,
+                    acquittee,
+                    equipement_id,
+                    type_alarme_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["alarme_id"],
+                    row["timestamp"].isoformat(),
+                    row["severite"],
+                    row["message"],
+                    row["acquittee"],
+                    row["equipement_id"],
+                    row["type_alarme"],
+                ),
+            )
+
         conn.commit()
 
     finally:
@@ -263,13 +287,15 @@ def main():
     etl_telemetrie.main()
     mesures_orbite = etl_orbite.main()
     etl_catalog.main()
-    etl_alarme.main()
+    alarme = etl_alarme.main()
 
     cnx = sqlite3.connect(SQL_DB)
     modele = pd.read_sql("SELECT * FROM modeles", cnx)
     type_alarme = pd.read_sql("SELECT * FROM seuils_alarmes", cnx)
 
-    charger_base(modele, site, mesures_orbite, type_alarme, equipement)
+    cnx.close()
+
+    charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme)
 
 if __name__ == "__main__":
     main()
