@@ -147,83 +147,10 @@ def nettoyage_csv(df):
     return df
 
 
-# def creer_db (chemin_db = SQL_DB):
-#     connexion = sqlite3.connect(chemin_db)
-#     connexion.execute("""
-#         CREATE TABLE IF NOT EXISTS solaire (
-#             id_solar              INTEGER PRIMARY KEY AUTOINCREMENT,
-#             date                  DATE,
-#             start_hour            INTEGER,
-#             end_hour              INTEGER,
-#             day_of_year           INTEGER,
-#             day_name              TEXT,
-#             month_name            TEXT,
-#             season                TEXT,
-#             production            INTEGER
-#         )
-#     """)
-#     connexion.commit()
-#     connexion.close()
-
-
-# def alimenter_solaire(df, chemin_db=SQL_DB):
-    
-#     connexion = sqlite3.connect(chemin_db)
-
-#     df_a_inserer = df.copy()
-#     df_a_inserer["Date"] = df_a_inserer["Date"].dt.strftime("%Y-%m-%d")
-#     df_a_inserer.to_sql("solaire", connexion, if_exists="replace", index=False)
-
-#     connexion.close()
-#     print(f"  {len(df)} lignes insérées dans db_solaire")
-
-# def executer_SQL(chemin_db=SQL_DB):
-#     connexion = sqlite3.connect(chemin_db)
-
-#     requetes = {
-#         "Nombre de relevés par saison": """
-#             SELECT season, COUNT(*) AS nb_releves
-#             FROM solaire GROUP BY season ORDER BY nb_releves DESC
-#         """,
-#         "Production moyenne par saison": """
-#             SELECT season, ROUND(AVG(production), 2) AS production_moyenne
-#             FROM solaire GROUP BY season ORDER BY production_moyenne DESC
-#         """,
-#         "Production moyenne par heure": """
-#             SELECT start_hour, end_hour, ROUND(AVG(production), 2) AS production_moyenne
-#             FROM solaire GROUP BY start_hour ORDER BY start_hour
-#         """,
-#         "Top 10 jours de production": """
-#             SELECT date, production FROM solaire
-#             ORDER BY production DESC LIMIT 10
-#         """,
-#         "Production moyenne par jour de semaine": """
-#             SELECT day_name, ROUND(AVG(production), 2) AS production_moyenne
-#             FROM solaire GROUP BY day_name ORDER BY production_moyenne DESC
-#         """,
-#     }
-
-#     for titre, requete in requetes.items():
-#         print(f"\n{titre}")
-#         print("-" * 40)
-#         resultat = pd.read_sql(requete, connexion)
-#         print(resultat.to_string(index=False))
-
-#     connexion.close()
-
 def main():
     df = lire_csv()
     df = nettoyage_csv(df)
-    # creer_db()
-    # alimenter_solaire(df)
-    # executer_SQL()
-    # df_sql = charger_donnees()
-    # graphique_production_temporelle(df_sql)
-    # graphique_production_par_heure(df_sql)
-    # modele, y_test, y_pred, dates_test = entrainer_modele(df_sql)
-    # entrainer_modele_groupe(df_sql)
-    # baseline_moyenne_groupe(df_sql)
-    # graphique_predictions(dates_test, y_test, y_pred)
+    return df
 
 if __name__ == "__main__":
     main()

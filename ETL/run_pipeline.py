@@ -121,7 +121,7 @@ def creer_base(cursor):
             )
         """)
 
-def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme):
+def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance):
     # Crée le dossier ./data s'il n'existe pas
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -274,6 +274,33 @@ def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme):
                 ),
             )
 
+        # Insertion des données de la table "maintenance"
+        for _, row in maintenance.iterrows():
+            cursor.execute(
+                """
+                INSERT INTO maintenance (
+                    maintenance_id,
+                    date_debut,
+                    date_fin,
+                    technicien,
+                    type_intervention,
+                    cout_eur,
+                    commentaire,
+                    equipement_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["maintenance_id"],
+                    row["date_debut"].isoformat(),
+                    row["date_fin"].isoformat(),
+                    row["technicien"],
+                    row["type_intervention"],
+                    row["cout_eur"],
+                    row["commentaire"],
+                    row["equipement_id"]
+                ),
+            )
+
         conn.commit()
 
     finally:
@@ -283,7 +310,7 @@ def charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme):
 def main():
     site = etl_sites.main()
     equipement = etl_equipements.main()
-    etl_maintenance.main()
+    maintenance = etl_maintenance.main()
     etl_telemetrie.main()
     mesures_orbite = etl_orbite.main()
     etl_catalog.main()
@@ -295,7 +322,7 @@ def main():
 
     cnx.close()
 
-    charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme)
+    charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance)
 
 if __name__ == "__main__":
     main()
