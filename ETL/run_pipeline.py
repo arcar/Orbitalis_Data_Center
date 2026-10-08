@@ -9,6 +9,7 @@ import etl_equipements
 import etl_orbite
 import etl_catalog
 import etl_alarme
+import create_db
 
 SQLITE_PATH = Path("./data/base_analytique.db")
 SQL_DB = "data/raw/catalogue.db"
@@ -346,6 +347,8 @@ def main():
     cnx.close()
 
     charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance, telemetrie)
+
+    # createDb = create_db.main()
 
 if __name__ == "__main__":
     main()
