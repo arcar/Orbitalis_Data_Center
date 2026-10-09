@@ -348,7 +348,7 @@ def main():
 
     charger_base(modele, site, mesures_orbite, type_alarme, equipement, alarme, maintenance, telemetrie)
 
-    # createDb = create_db.main()
+    createDb = create_db.main()
 
 if __name__ == "__main__":
     main()

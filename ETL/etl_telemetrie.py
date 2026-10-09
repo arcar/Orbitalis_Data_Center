@@ -1,8 +1,8 @@
 import pandas as pd
 from pathlib import Path
-import sqlite3
 from dateutil import parser as dtparser
 from datetime import timezone
+import re
 
 CSV_PATH = "data/raw/telemetrie.csv"
 OUTPUT_PATH = "data/telemetrie_propre.csv"
@@ -19,13 +19,18 @@ def lire_csv():
     return df
 
 def parse_ts(s):
-    dt = dtparser.parse(s, dayfirst=True)   # "01/05/2025" -> jour=01, mois=05
+    if pd.isna(s):
+        return pd.NaT
+    s = str(s).strip()
+    # ISO (AAAA-MM-JJ...) : jamais dayfirst ; sinon (JJ/MM/AAAA) : dayfirst
+    dayfirst = not re.match(r"^\d{4}-\d{2}-\d{2}", s)
+    try:
+        dt = dtparser.parse(s, dayfirst=dayfirst)
+    except (ValueError, OverflowError):
+        return pd.NaT
     if dt.tzinfo is None:
-        # Aucune indication de fuseau -> on suppose que c'est déjà de l'UTC
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 def nettoyage_csv(df):
 
@@ -57,6 +62,8 @@ def nettoyage_csv(df):
     df_rejets_date_manquante["motif_rejet"] = "date manquante"
     print(len(idx_manquantes), "ligne(s) date manquante(s) supprimée(s)")
     df = df.drop(index=idx_manquantes)
+
+
 
     # Date dans le futur
     maintenant = pd.Timestamp.now(tz="UTC")
@@ -142,7 +149,7 @@ def nettoyage_csv(df):
         id_equip_rejet = df["equipement_id"].isin(ids_inconnus)
         df_rejets_id_site = df[id_equip_rejet].copy()
         df_rejets_id_site["motif_rejet"] = "equipement_id inexistant"
-        df = df[~df["site_id"].isin(ids_inconnus)]
+        df = df[~id_equip_rejet].copy()
         nb_supprimees = nb_avant - len(df)
         print(f"Nombre total de lignes supprimées : {nb_supprimees}")
     else:
@@ -156,19 +163,12 @@ def nettoyage_csv(df):
 
     print("\n7 : Vérification et suppression doublons")
     print("-" * 40)
-    nb_lignes_avant = len(df)
-    print(f"\nNombre de données : {nb_lignes_avant}")
-    doublons_count = df.duplicated().sum()
-    print(f"\nNombre de doublons : {doublons_count}")
-    doublons = df.duplicated
-    df_rejets_doublons = df[doublons].copy()
-    df_rejets_doublons["motif_rejet"] = "doublon"
-    if doublons_count > 0:
-        df = df.drop_duplicates()
-        nb_lignes_apres = len(df)
-        print(f"\nDoublons supprimés, nouveau nombre de données : {nb_lignes_apres}\n")
-    else : 
-        nb_lignes_apres = len(df)
+    nb_avant = len(df)
+    doublons_cle = df.duplicated(subset=["equipement_id", "timestamp"], keep="first")
+    df_rejets_doublons = df[doublons_cle].copy()
+    df_rejets_doublons["motif_rejet"] = "doublon equipement/timestamp"
+    df = df[~doublons_cle].copy()
+    print(f"{doublons_cle.sum()} doublon(s) supprimé(s) ({nb_avant} -> {len(df)} lignes)")
 
 
 
@@ -178,7 +178,9 @@ def nettoyage_csv(df):
     
     valeurs_manquantes = df.isnull().sum().sum()
     print(f"\nTotal valeurs manquantes : {valeurs_manquantes}\n")
-    df.to_csv(OUTPUT_PATH, index=False)
+    df_sortie = df.copy()
+    df_sortie["timestamp"] = df_sortie["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    df_sortie.to_csv(OUTPUT_PATH, index=False)
     print(f"\nFichier nettoyé : '{OUTPUT_PATH}'")
     print(f"\nFichier lignes rejetées généré : '{REJETS_PATH}'")
 
@@ -187,7 +189,7 @@ def nettoyage_csv(df):
 
 def main():
     df = lire_csv()
-   
+    
     df = nettoyage_csv(df)
 
     return df
