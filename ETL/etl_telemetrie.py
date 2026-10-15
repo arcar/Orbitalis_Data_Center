@@ -21,16 +21,27 @@ def lire_csv():
 def parse_ts(s):
     if pd.isna(s):
         return pd.NaT
+
     s = str(s).strip()
-    # ISO (AAAA-MM-JJ...) : jamais dayfirst ; sinon (JJ/MM/AAAA) : dayfirst
-    dayfirst = not re.match(r"^\d{4}-\d{2}-\d{2}", s)
-    try:
-        dt = dtparser.parse(s, dayfirst=dayfirst)
-    except (ValueError, OverflowError):
-        return pd.NaT
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+
+    # On teste d'abord les formats connus
+    formats = [
+        "%d/%m/%Y %H:%M",          # 01/05/2025 00:00
+        "%Y-%m-%d %H:%M:%S.%fZ",   # 2025-05-01 00:05:00.000Z
+        "%Y-%m-%d %H:%M:%S",       # 2025-05-01 00:05:00
+        "%Y/%m/%d %H:%M",          # 2025/05/01 00:10
+        "%Y-%m-%dT%H:%M:%S",       # 2025-05-01T00:15:00
+    ]
+
+    for fmt in formats:
+        try:
+            return pd.to_datetime(
+                s, format=fmt, utc=True, errors="raise"
+            )
+        except (ValueError, TypeError):
+            pass
+
+    return pd.NaT
 
 def nettoyage_csv(df):
 
