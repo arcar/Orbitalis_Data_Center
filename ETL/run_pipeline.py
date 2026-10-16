@@ -337,8 +337,8 @@ def main():
     site = etl_sites.main()
     equipement = etl_equipements.main()
     maintenance = etl_maintenance.main()
-    telemetrie = etl_telemetrie.main()
     mesures_orbite = etl_orbite.main()
+    telemetrie = etl_telemetrie.main()
     modele = etl_catalog.main()
     alarme = etl_alarme.main()
 
