@@ -1,13 +1,3 @@
-"""Maintenance prédictive : risque de dégradation d'un équipement dans les 9 h.
-
-Usage : python maintenance_predictive.py [chemin/base_etoile.duckdb]
-
-Définition de la cible y(t) = 1 si, dans les 9 h suivantes (t, t+9h] :
-  - la performance moyenne HORS ÉCLIPSE passe sous 0,65
-  OU
-  - au moins une alarme 'critical' (ou 'URGENCE') de type perte_puissance / surchauffe
-    est enregistrée.
-"""
 import sys
 from pathlib import Path
 

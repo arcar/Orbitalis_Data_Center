@@ -11,7 +11,7 @@ SQL_DB = "data/raw/catalogue.db"
 dossier_sortie = Path("data/lignes_rejetees")
 dossier_sortie.mkdir(parents=True, exist_ok=True)
 REJETS_PATH = "telemetrie_lignes_rejetees.csv"
-
+ENV_PATH = "data/orbite_propre.csv"
 
 
 def lire_csv():
@@ -181,8 +181,49 @@ def nettoyage_csv(df):
     df = df[~doublons_cle].copy()
     print(f"{doublons_cle.sum()} doublon(s) supprimé(s) ({nb_avant} -> {len(df)} lignes)")
 
+    print("\n8 : Réparation des puissances aberrantes (> puissance nominale)")
+    print("-" * 40)
 
+    # Puissance nominale et site de chaque équipement (data_equip est déjà lu à l'étape 6)
+    df = df.merge(
+        data_equip[["equipement_id", "site_id", "puissance_nominale_w"]],
+        on="equipement_id", how="left",
+    )
 
+    # Phase (ensoleillement / éclipse) : l'environnement est toutes les 15 min,
+    # on prend la dernière phase connue pour le site
+    env = pd.read_csv(ENV_PATH)
+    env["timestamp"] = pd.to_datetime(env["timestamp"].apply(parse_ts), utc=True)
+    df["timestamp"]  = df["timestamp"].astype("datetime64[ns, UTC]")
+    env["timestamp"] = env["timestamp"].astype("datetime64[ns, UTC]")
+
+    df = pd.merge_asof(
+        df.sort_values("timestamp"),
+        env[["timestamp", "site_id", "phase"]].sort_values("timestamp"),
+        on="timestamp", by="site_id",
+        direction="backward", tolerance=pd.Timedelta("15min"),
+    )
+
+    # Valeurs aberrantes
+    df = df.sort_values(["equipement_id", "timestamp"]).reset_index(drop=True)
+
+    # Numéro d'intervalle continu de même phase, par équipement
+    nouveau_bloc = df["phase"] != df.groupby("equipement_id")["phase"].shift()
+    df["bloc_phase"] = nouveau_bloc.groupby(df["equipement_id"]).cumsum()
+
+    aberrante = df["puissance_w"] > df["puissance_nominale_w"]
+
+    # Moyenne des valeurs valides du même équipement dans le même intervalle
+    valides = df["puissance_w"].where(~aberrante)
+    moyenne = valides.groupby(
+        [df["equipement_id"], df["bloc_phase"]]
+    ).transform("mean")
+
+    df["puissance_w_brute"]  = df["puissance_w"]
+    df["puissance_w"]        = df["puissance_w"].where(~aberrante, moyenne).round(2)
+    df["puissance_corrigee"] = aberrante
+
+    df = df.drop(columns=["puissance_nominale_w", "site_id", "bloc_phase"])
     df_rejets_total = pd.concat([df_rejets_doublons, df_rejets_date_manquante, df_rejets_date_futur,df_rejets_id_eq, df_rejets_id_site], ignore_index=True)
     df_rejets_total.to_csv(dossier_sortie / REJETS_PATH, index=False)
 
