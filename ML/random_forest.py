@@ -2,6 +2,7 @@
 import duckdb
 import numpy as np
 import pandas as pd
+import joblib
 
 from pathlib import Path
 
@@ -511,6 +512,11 @@ def entrainer_modele(df):
     print(df_importances.head(15).to_string(index=False))
 
     print("\nImportances enregistrées dans :", chemin_importances)
+
+    chemin_modele = DATA_DIR / "modele_random_forest.joblib"
+    joblib.dump(modele, chemin_modele)
+
+    print("Modèle sauvegardé dans :", chemin_modele)
 
     return modele
 

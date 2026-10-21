@@ -1,6 +1,7 @@
 import duckdb
 import numpy as np
 import pandas as pd
+import joblib
 
 from pathlib import Path
 
@@ -387,6 +388,11 @@ def entrainer_modele(df):
     resultats.to_csv(chemin_resultats, index=False)
 
     print("\nRésultats enregistrés dans :", chemin_resultats)
+
+    chemin_modele = DATA_DIR / "modele_regression_logistique.joblib"
+    joblib.dump(modele, chemin_modele)
+
+    print("Modèle sauvegardé dans :", chemin_modele)
 
     return modele
 
