@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from dateutil import parser as dtparser
 from datetime import timezone
@@ -96,50 +97,6 @@ def nettoyage_csv(df):
     apres = len(df)
     print((avant - apres), "ligne(s) supprimée(s) car Id_Equipement incorrect")
 
-
-    print("\n5 : Valeurs négatives/absentes et arrondi à 2 décimales")
-    print("-" * 40)
-
-    # Le timestamp a été stocké en texte ISO à l'étape 3 : on le reparse pour extraire l'heure
-    ts = pd.to_datetime(df["timestamp"], utc=True)
-    df["heure_creneau"] = ts.dt.strftime("%H:%M")
-
-    # Colonnes où une valeur négative n'a pas de sens physique -> traitée comme invalide
-    colonnes_sans_negatif = ["puissance_w", "rayonnement", "tension_v", "courant_a"]
-    # Colonne où seule l'absence de valeur pose problème (le négatif est valide)
-    colonnes_valeur_libre = ["temperature_c"]
-
-    for colonne in colonnes_sans_negatif + colonnes_valeur_libre:
-        if colonne in colonnes_sans_negatif:
-            masque_invalide = (df[colonne] < 0) | (df[colonne].isna())
-        else:
-            masque_invalide = df[colonne].isna()
-
-        print(f"{colonne} : {masque_invalide.sum()} valeur(s) invalide(s) avant traitement")
-
-        moyenne_par_equip_heure = (
-            df.loc[~masque_invalide]
-              .groupby(["equipement_id", "heure_creneau"])[colonne]
-              .mean()
-              .reset_index()
-              .rename(columns={colonne: f"{colonne}_moyenne"})
-        )
-
-        df = df.merge(moyenne_par_equip_heure, on=["equipement_id", "heure_creneau"], how="left")
-        df.loc[masque_invalide, colonne] = df.loc[masque_invalide, f"{colonne}_moyenne"]
-        df = df.drop(columns=[f"{colonne}_moyenne"])
-
-        df[colonne] = df[colonne].round(2)
-
-        if colonne in colonnes_sans_negatif:
-            nb_apres = ((df[colonne] < 0) | df[colonne].isna()).sum()
-        else:
-            nb_apres = df[colonne].isna().sum()
-        print(f"{colonne} : {nb_apres} valeur(s) invalide(s) après traitement")
-
-    df = df.drop(columns=["heure_creneau"])
-
-
     # Modification des valeurs de "id_site"  pour s'assurer que l'on a les mêmes equipements que le fichier sites.csv
     print("\n6 : Cohérence equipement_id avec fichier equipements.csv")
     print("-" * 40)
@@ -181,81 +138,379 @@ def nettoyage_csv(df):
     df = df[~doublons_cle].copy()
     print(f"{doublons_cle.sum()} doublon(s) supprimé(s) ({nb_avant} -> {len(df)} lignes)")
 
-    print("\n8 : Réparation des puissances aberrantes (> puissance nominale)")
-    print("-" * 40)
+# ============================================================
+# # 8 : PHASES, VALEURS ABERRANTES ET IMPUTATION
+# ============================================================
 
-    # Puissance nominale et site de chaque équipement (data_equip est déjà lu à l'étape 6)
+    print("\n8 : Correction des valeurs par séquence de phase")
+    print("-" * 60)
+
+    # ------------------------------------------------------------
+    # 8.1 : Récupération des informations des équipements
+    # ------------------------------------------------------------
+
     df = df.merge(
-        data_equip[["equipement_id", "site_id", "puissance_nominale_w"]],
-        on="equipement_id", how="left",
+        data_equip[
+            [
+                "equipement_id",
+                "site_id",
+                "puissance_nominale_w",
+            ]
+        ].drop_duplicates(subset=["equipement_id"]),
+        on="equipement_id",
+        how="left",
+        validate="many_to_one",
     )
 
-    # Phase (ensoleillement / éclipse) : l'environnement est toutes les 15 min,
-    # on prend la dernière phase connue pour le site
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+
+    # ------------------------------------------------------------
+    # 8.2 : Récupération de la phase environnementale
+    # ------------------------------------------------------------
+
     env = pd.read_csv(ENV_PATH)
-    env["timestamp"] = pd.to_datetime(env["timestamp"].apply(parse_ts), utc=True)
-    df["timestamp"]  = df["timestamp"].astype("datetime64[ns, UTC]")
-    env["timestamp"] = env["timestamp"].astype("datetime64[ns, UTC]")
+
+    # Conversion explicite des timestamps en UTC
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    env["timestamp"] = pd.to_datetime(env["timestamp"], utc=True, errors="coerce")
+
+    # Normalisation des identifiants
+    df["site_id"] = df["site_id"].astype("string").str.strip()
+    env["site_id"] = env["site_id"].astype("string").str.strip()
+
+    env["phase"] = (env["phase"].astype("string").str.strip().str.lower())
+
+    # Éliminer les lignes environnementales inutilisables
+    env = env.dropna(subset=["timestamp", "site_id", "phase"]).copy()
+
+    env = env[env["phase"].isin(["ensoleillement", "eclipse"])].copy()
+
+    # Vérifier les phases contradictoires à un même instant et site
+    conflits = (env.groupby(["site_id", "timestamp"])["phase"].nunique())
+
+    if (conflits > 1).any():
+        raise ValueError("Phases contradictoires pour un même site et timestamp.")
+
+    env = env.drop_duplicates(subset=["site_id", "timestamp"])
+
+    # Trier globalement sur le timestamp : c'est indispensable
+    # pour merge_asof.
+    gauche = (
+        df.drop(columns=["phase"], errors="ignore")
+        .dropna(subset=["timestamp", "site_id"])
+        .sort_values("timestamp")
+        .copy()
+    )
+
+    droite = (
+        env[["timestamp", "site_id", "phase"]]
+        .sort_values("timestamp")
+        .copy()
+    )
 
     df = pd.merge_asof(
-        df.sort_values("timestamp"),
-        env[["timestamp", "site_id", "phase"]].sort_values("timestamp"),
-        on="timestamp", by="site_id",
-        direction="backward", tolerance=pd.Timedelta("15min"),
+        gauche,
+        droite,
+        on="timestamp",
+        by="site_id",
+        direction="backward",
+        tolerance=pd.Timedelta("15min"),
     )
 
-    # Valeurs aberrantes
-    df = df.sort_values(["equipement_id", "timestamp"]).reset_index(drop=True)
+    print(
+        "Mesures sans phase après jointure :",
+        int(df["phase"].isna().sum()),
+    )
 
-    # Numéro d'intervalle continu de même phase, par équipement
-    nouveau_bloc = df["phase"] != df.groupby("equipement_id")["phase"].shift()
-    df["bloc_phase"] = nouveau_bloc.groupby(df["equipement_id"]).cumsum()
+    print("\nRépartition des phases :")
+    print(df["phase"].value_counts(dropna=False))
 
-    aberrante = df["puissance_w"] > df["puissance_nominale_w"]
+# ------------------------------------------------------------
+# 8.2 bis : Récupération des phases manquantes par la température
+# ------------------------------------------------------------
 
-    # Moyenne des valeurs valides du même équipement dans le même intervalle
-    valides = df["puissance_w"].where(~aberrante)
-    moyenne = valides.groupby(
-        [df["equipement_id"], df["bloc_phase"]]
-    ).transform("mean")
+    # Compter les phases manquantes avant correction
+    masque_phase_manquante = df["phase"].isna()
+    nb_phases_manquantes = int(masque_phase_manquante.sum())
 
-    df["puissance_w_brute"]  = df["puissance_w"]
-    df["puissance_w"]        = df["puissance_w"].where(~aberrante, moyenne).round(2)
-    df["puissance_corrigee"] = aberrante
+    print("\nPhases manquantes avant correction :", nb_phases_manquantes,)
 
-    df = df.drop(columns=["puissance_nominale_w", "site_id", "bloc_phase"])
-    df_rejets_total = pd.concat([df_rejets_doublons, df_rejets_date_manquante, df_rejets_date_futur,df_rejets_id_eq, df_rejets_id_site], ignore_index=True)
-    df_rejets_total.to_csv(dossier_sortie / REJETS_PATH, index=False)
+    # S'assurer que la température est numérique
+    df["temperature_c"] = pd.to_numeric(
+        df["temperature_c"],
+        errors="coerce",
+    )
 
-    
-    valeurs_manquantes = df.isnull().sum().sum()
-    print(f"\nTotal valeurs manquantes : {valeurs_manquantes}\n")
+    # Inférer la phase uniquement si la jointure n'a rien trouvé
+    df.loc[
+        masque_phase_manquante
+        & (df["temperature_c"] >= 0),
+        "phase",
+    ] = "ensoleillement"
+
+    df.loc[
+        masque_phase_manquante
+        & (df["temperature_c"] < 0),
+        "phase",
+    ] = "eclipse"
+
+    # Vérifier le résultat
+    print(
+        "Phases déduites de la température :",
+        int(
+            (
+                masque_phase_manquante
+                & df["temperature_c"].notna()
+            ).sum()
+        ),
+    )
+
+    print(
+        "Phases encore manquantes :",
+        int(df["phase"].isna().sum()),
+    )
+
+    print("\nRépartition des phases après correction :")
+    print(df["phase"].value_counts(dropna=False))
+
+    # ------------------------------------------------------------
+    # 8.3 : Identification des séquences continues de phase
+    # ------------------------------------------------------------
+
+    # Une nouvelle séquence commence lorsque la phase change.
+    # Une phase inconnue constitue également une séparation :
+    # on ne mélange pas les valeurs de part et d'autre.
+
+   # Trier les données avant de rechercher les changements de phase.
+    df = df.sort_values(
+        ["equipement_id", "timestamp"]
+    ).reset_index(drop=True)
+
+    # Convertir la phase en chaîne Python classique.
+    # Cela évite les problèmes de conversion liés à string[pyarrow].
+    phase_bloc = (
+        df["phase"]
+        .astype(object)
+        .where(df["phase"].notna(), "__PHASE_INCONNUE__")
+    )
+
+    # Phase précédente pour chaque équipement.
+    phase_precedente = (
+        phase_bloc.groupby(df["equipement_id"], sort=False)
+        .shift()
+    )
+
+    # Nouvelle séquence :
+    # 1. première mesure de l'équipement ;
+    # 2. changement de phase ;
+    # 3. passage vers ou depuis une phase inconnue.
+    nouveau_bloc = (
+        phase_precedente.isna()
+        | phase_bloc.ne(phase_precedente)
+    )
+
+    # Convertir explicitement en booléens NumPy sans valeur manquante.
+    nouveau_bloc = nouveau_bloc.fillna(True).to_numpy(dtype=bool)
+
+    # Numéro de séquence indépendant pour chaque équipement.
+    df["bloc_phase"] = (
+        pd.Series(nouveau_bloc, index=df.index)
+        .astype("int64")
+        .groupby(df["equipement_id"], sort=False)
+        .cumsum()
+    )
+
+    # Une mesure sans phase connue ne sera pas imputée.
+    phase_connue = df["phase"].notna()
+
+    print("Séquences de phase identifiées :", df["bloc_phase"].nunique())
+    print("Mesures sans phase :", int((~phase_connue).sum()))
+    # ------------------------------------------------------------
+    # 8.4 : Définition des valeurs invalides
+    # ------------------------------------------------------------
+
+    colonnes_sans_negatif = [
+        "puissance_w",
+        "rayonnement",
+        "tension_v",
+        "courant_a",
+    ]
+
+    colonnes_valeur_libre = ["temperature_c",]
+
+    colonnes_mesures = (colonnes_sans_negatif + colonnes_valeur_libre)
+
+    # Conversion explicite en numérique.
+    for colonne in colonnes_mesures:
+        df[colonne] = pd.to_numeric(
+            df[colonne],
+            errors="coerce",
+        )
+
+    # Conserver les valeurs initiales pour l'audit.
+    df["puissance_w_brute"] = df["puissance_w"]
+
+    df["puissance_corrigee"] = False
+
+    # Les valeurs négatives sont invalides pour ces mesures.
+    for colonne in colonnes_sans_negatif:
+
+        masque_negatif = df[colonne] < 0
+
+        df.loc[masque_negatif, colonne] = np.nan
+
+    # Une puissance supérieure à la puissance nominale
+    # est traitée comme une valeur aberrante.
+    puissance_nominale = pd.to_numeric(df["puissance_nominale_w"], errors="coerce",)
+
+    masque_puissance_aberrante = (
+        df["puissance_w"].notna()
+        & puissance_nominale.notna()
+        & (df["puissance_w"] > puissance_nominale)
+    )
+
+    df.loc[masque_puissance_aberrante, "puissance_w",] = np.nan
+
+    df.loc[
+        masque_puissance_aberrante,
+        "puissance_corrigee",
+    ] = True
+
+    print("Puissances supérieures à la puissance nominale :", int(masque_puissance_aberrante.sum()),)
+
+    # ------------------------------------------------------------
+    # 8.5 : Imputation par moyenne de la même séquence
+    # ------------------------------------------------------------
+
+    cles_groupement = [df["equipement_id"], df["bloc_phase"],]
+
+    for colonne in colonnes_mesures:
+
+        masque_manquant = df[colonne].isna()
+
+        # La moyenne utilise uniquement les valeurs valides
+        # de cet équipement dans cette séquence de phase.
+        valeurs_valides = df[colonne].where(phase_connue & df[colonne].notna())
+
+        moyenne_sequence = valeurs_valides.groupby(cles_groupement).transform("mean")
+
+        # Remplacement uniquement si une phase est connue
+        # et si au moins une valeur valide permet une moyenne.
+        masque_imputable = (
+            masque_manquant
+            & phase_connue
+            & moyenne_sequence.notna()
+        )
+
+        nombre_a_remplacer = int(masque_imputable.sum())
+
+        df.loc[masque_imputable, colonne,] = moyenne_sequence.loc[masque_imputable]
+
+        df[colonne] = df[colonne].round(2)
+
+        # Marquer également les puissances remplacées
+        # à cause d'une valeur manquante ou invalide.
+        if colonne == "puissance_w":
+            df.loc[
+                masque_imputable,
+                "puissance_corrigee",
+            ] = True
+
+        print(
+            f"{colonne} : "
+            f"{nombre_a_remplacer} valeur(s) remplacée(s), "
+            f"{int(df[colonne].isna().sum())} valeur(s) "
+            "encore manquante(s)"
+        )
+
+    # Diagnostic des mesures sans phase
+    sans_phase = df[df["phase"].isna()]
+
+    print("\n--- DIAGNOSTIC DES MESURES SANS PHASE ---")
+    print("Nombre de mesures :", len(sans_phase))
+    print("Sites concernés :")
+    print(sans_phase["site_id"].value_counts(dropna=False))
+
+    if not sans_phase.empty:
+        print("\nPremiers timestamps sans phase :")
+        print(
+            sans_phase[["site_id", "timestamp"]]
+            .head(20)
+            .to_string(index=False)
+        )
+
+    # ------------------------------------------------------------
+    # 8.6 : Nettoyage des colonnes techniques
+    # ------------------------------------------------------------
+
+    df = df.drop(
+        columns=[
+            "puissance_nominale_w",
+            "site_id",
+            "bloc_phase",
+        ],
+        errors="ignore",
+    )
+
+    # Vérification des valeurs manquantes restantes.
+    print("\nValeurs manquantes après imputation :")
+
+    print(
+        df[
+            colonnes_mesures
+        ].isna().sum()
+    )
+
+    print(
+        "\nTotal des valeurs manquantes dans le DataFrame :",
+        int(df.isna().sum().sum()),
+    )
+
+    # ------------------------------------------------------------
+    # 8.7 : Export des rejets et des données nettoyées
+    # ------------------------------------------------------------
+
+    df_rejets_total = pd.concat(
+        [
+            df_rejets_doublons,
+            df_rejets_date_manquante,
+            df_rejets_date_futur,
+            df_rejets_id_eq,
+            df_rejets_id_site,
+        ],
+        ignore_index=True,
+    )
+
+    df_rejets_total.to_csv(
+        dossier_sortie / REJETS_PATH,
+        index=False,
+    )
+
     df_sortie = df.copy()
-    df_sortie["timestamp"] = df_sortie["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    df_sortie.to_csv(OUTPUT_PATH, index=False)
+
+    df_sortie["timestamp"] = (
+        df_sortie["timestamp"]
+        .dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    )
+
+    df_sortie.to_csv(OUTPUT_PATH, index=False,)
+
     print(f"\nFichier nettoyé : '{OUTPUT_PATH}'")
-    print(f"\nFichier lignes rejetées généré : '{REJETS_PATH}'")
+
+    print("\nFichier lignes rejetées généré :", dossier_sortie / REJETS_PATH,)
 
     return df
 
-
 def main():
     df = lire_csv()
-    
     df = nettoyage_csv(df)
 
     return df
     
-    # creer_db()
-    # alimenter_solaire(df)
-    # executer_SQL()
-    # df_sql = charger_donnees()
-    # graphique_production_temporelle(df_sql)
-    # graphique_production_par_heure(df_sql)
-    # modele, y_test, y_pred, dates_test = entrainer_modele(df_sql)
-    # entrainer_modele_groupe(df_sql)
-    # baseline_moyenne_groupe(df_sql)
-    # graphique_predictions(dates_test, y_test, y_pred)
 
 if __name__ == "__main__":
     main()
