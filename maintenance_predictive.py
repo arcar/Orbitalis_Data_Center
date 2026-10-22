@@ -1,230 +1,298 @@
 import sys
 from pathlib import Path
-
 import duckdb
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.inspection import permutation_importance
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, confusion_matrix, roc_auc_score
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import (average_precision_score, precision_recall_curve,
+                             classification_report, confusion_matrix,
+                             ConfusionMatrixDisplay, balanced_accuracy_score,
+                             roc_auc_score, precision_score, recall_score)
 
-# ----------------------------- Paramètres ---------------------------------
+# ============================== CONFIG ==============================
 STAR_DB = (Path(sys.argv[1]) if len(sys.argv) > 1
            else Path(__file__).resolve().parent / "data" / "base_etoile.duckdb")
 
 PAS_MIN = 5                      # pas de la télémétrie (minutes)
 HORIZON_H = 9                    # horizon de prédiction (6 périodes orbitales de 90 min)
 H = HORIZON_H * 60 // PAS_MIN    # 108 pas
-SEUIL_PERF = 0.65
-PERF_MAX = 1.5                                      # au-delà : mesure invalide
-PERF_TYPES = {"panneau_solaire", "convertisseur_DC"}  # types où la performance a un sens
-ECLIPSE_REGEX = "eclipse|éclipse"            # à adapter aux valeurs de la colonne phase
-ALARMES_CIBLES = {"perte_puissance", "surchauffe"}
-SEVERITES_CRITIQUES = {"critical", "urgence"}  # comparées en minuscules
+PERIODE = 90 // PAS_MIN          # 18 pas par orbite
+SEUIL_PERF = 0.45                # seuil sur la performance AU SOLEIL
+PHASE_SOLEIL = None              # None = détection auto ; sinon "ensoleillement"
+PRECISION_CIBLE = 0.90           # pour la comparaison à précision fixée
+# ====================================================================
 
-SEULEMENT_SAINS = True   # True : prédire l'entrée en dégradation (équipements sains à t)
+# ---------- 1. Chargement ----------
+con = duckdb.connect(str(STAR_DB), read_only=True)
+df = con.execute("""
+    SELECT
+        f.equipement_id,
+        make_timestamp(t.annee, t.mois, t.jour, t.heure, t.minute, 0) AS ts,
+        f.puissance_w::DOUBLE              AS puissance_w,
+        f.temperature_c::DOUBLE            AS temperature_c,
+        f.rayonnement::DOUBLE              AS rayonnement,
+        f.tension_v::DOUBLE                AS tension_v,
+        f.courant_a::DOUBLE                AS courant_a,
+        f.performance::DOUBLE              AS performance,
+        f.ratio_vie_equipement::DOUBLE     AS ratio_vie,
+        f.rayonnement_solaire_w_m2::DOUBLE AS ray_solaire,
+        f.temperature_ambiante_c::DOUBLE   AS temp_amb,
+        f.phase,
+        e.type_equipement,
+        e.puissance_nominale_w::DOUBLE     AS p_nominale,
+        e.rendement_nominal::DOUBLE        AS rend_nominal,
+        a.severite,
+        m.type_maintenance
+    FROM fait_production f
+    JOIN dim_temps t       ON t.temps_id = f.temps_id
+    JOIN dim_equipement e  ON e.equipement_id = f.equipement_id
+    LEFT JOIN dim_alarme a      ON a.alarme_id = f.alarme_id
+    LEFT JOIN dim_maintenance m ON m.maintenance_id = f.maintenance_id
+    ORDER BY f.equipement_id, ts
+""").df()
+con.close()
 
-COUT_FN, COUT_FP, COUT_TP, COUT_TN = 2500, 150, 300, 0
-PART_TRAIN, PART_VAL = 0.60, 0.80            # coupures temporelles (60 % / 20 % / 20 %)
+print("Phases et performance moyenne :")
+print(df.groupby("phase")["performance"].agg(["count", "mean", "median"]))
 
+if PHASE_SOLEIL is None:
+    PHASE_SOLEIL = df.groupby("phase")["performance"].mean().idxmax()
+print(f"\nPhase ensoleillée retenue : {PHASE_SOLEIL!r}")
 
-# ----------------------------- Données ------------------------------------
-def charger():
-    con = duckdb.connect(str(STAR_DB), read_only=True)
-    df = con.execute("""
-        SELECT strptime(CAST(f.temps_id AS VARCHAR), '%Y%m%d%H%M') AS ts,
-               f.equipement_id, e.type_equipement, e.puissance_nominale_w,
-               f.puissance_w, f.temperature_c, f.tension_v, f.courant_a,
-               f.rayonnement, f.performance, f.ratio_vie_equipement, f.phase,
-               f.rayonnement_solaire_w_m2, f.temperature_ambiante_c,
-               (f.maintenance_id IS NOT NULL) AS en_maintenance,
-               a.type_alarme, a.severite
-        FROM fait_production f
-        JOIN dim_equipement e ON e.equipement_id = f.equipement_id
-        LEFT JOIN dim_alarme a ON a.alarme_id = f.alarme_id
-    """).fetchdf()
-    con.close()
-    return df
+soleil = df[df["phase"] == PHASE_SOLEIL]["performance"]
+print("Performance au soleil :")
+print(soleil.describe())
+print(f"Part au soleil sous {SEUIL_PERF} : {(soleil < SEUIL_PERF).mean():.2%}\n")
 
+# ---------- 2. Cible + features, équipement par équipement ----------
+SIGNAUX_PHYSIQUES = ["temperature_c", "tension_v", "courant_a",
+                     "puissance_w", "ray_solaire", "ecart_temp"]
 
-def futur(s, fonction, min_periods):
-    """Agrégat sur la fenêtre (t, t+H] : exclut t, regarde uniquement vers l'avant."""
-    inverse = s[::-1].rolling(H, min_periods=min_periods)
-    return getattr(inverse, fonction)()[::-1].shift(-1)
+def construire(g: pd.DataFrame) -> pd.DataFrame:
+    g = g.sort_values("ts").drop_duplicates("ts").set_index("ts").copy()
+    au_soleil = (g["phase"] == PHASE_SOLEIL)
+    p = g["performance"]
+    p_soleil = p.where(au_soleil)                        # NaN pendant l'éclipse
 
+    # Cible : la perf au soleil passe sous le seuil au moins une fois dans les H prochains pas
+    futur_min = p_soleil[::-1].rolling(H, min_periods=1).min()[::-1].shift(-1)
+    g["y"] = (futur_min < SEUIL_PERF).astype(float)
+    g.loc[futur_min.isna(), "y"] = np.nan
 
-def construire(df):
-    for c in ["puissance_nominale_w", "puissance_w", "temperature_c", "tension_v",
-              "courant_a", "rayonnement", "performance", "ratio_vie_equipement",
-              "rayonnement_solaire_w_m2", "temperature_ambiante_c"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+    # Délai avant la prochaine chute (heures) : analyse uniquement, pas une variable du modèle
+    t_evt = pd.Series(g.index, index=g.index).where((p_soleil < SEUIL_PERF).values)
+    t_next = t_evt.shift(-1).bfill()
+    g["delai_h"] = (t_next - pd.Series(g.index, index=g.index)).dt.total_seconds() / 3600
 
-    # Qualité de la performance : (1) valeurs physiquement impossibles -> invalides ;
-    # (2) types d'équipement pour lesquels puissance/puissance nominale n'est pas un
-    # indicateur de santé (ex. batterie) -> critère de performance non applicable.
-    n_aberrantes = int((df["performance"] > PERF_MAX).sum())
-    df.loc[df["performance"] > PERF_MAX, "performance"] = np.nan
-    df.loc[~df["type_equipement"].isin(PERF_TYPES), "performance"] = np.nan
-    print(f"Performance : {n_aberrantes} valeur(s) > {PERF_MAX} mises à NaN ; "
-          f"critère appliqué seulement à {sorted(PERF_TYPES)}")
+    # --- Historique de la performance au soleil
+    ps = p_soleil.ffill(limit=PERIODE)                   # dernière valeur solaire connue
+    for lag in [1, 2, 3, PERIODE // 2, PERIODE, 2 * PERIODE, 6 * PERIODE]:
+        g[f"perf_lag_{lag}"] = ps.shift(lag)
+    for w in [PERIODE, 3 * PERIODE, 6 * PERIODE]:
+        g[f"perf_mean_{w}"] = p_soleil.rolling(w, min_periods=3).mean()
+        g[f"perf_std_{w}"] = p_soleil.rolling(w, min_periods=3).std()
+        g[f"perf_min_{w}"] = p_soleil.rolling(w, min_periods=3).min()
+    g["perf_tendance"] = p_soleil.rolling(6 * PERIODE, min_periods=10).mean().diff(PERIODE)
+    g["dist_seuil"] = ps - SEUIL_PERF
 
-    df = df.sort_values(["equipement_id", "ts"]).reset_index(drop=True)
-    g = df.groupby("equipement_id", sort=False)
+    # État courant : dernière performance connue au soleil encore au-dessus du seuil
+    g["etat_ok"] = (ps >= SEUIL_PERF).astype(float)
 
-    eclipse = df["phase"].fillna("").str.contains(ECLIPSE_REGEX, case=False, regex=True)
-    if not eclipse.any():
-        raise ValueError(f"Aucune éclipse détectée. Valeurs de phase : "
-                         f"{df['phase'].value_counts(dropna=False).to_dict()} "
-                         f"-> adapte ECLIPSE_REGEX.")
-    df["is_eclipse"] = eclipse.astype(int)
-    df["perf_hors_eclipse"] = df["performance"].where(~eclipse)
-    df["alarme_cible"] = (df["type_alarme"].isin(ALARMES_CIBLES)
-                          & df["severite"].str.lower().isin(SEVERITES_CRITIQUES)).astype(int)
-    df["en_maintenance"] = df["en_maintenance"].astype(int)
+    # --- Signaux physiques instantanés (variables de base)
+    g["ecart_temp"] = g["temperature_c"] - g["temp_amb"]
+    for c in ["temperature_c", "tension_v", "courant_a", "puissance_w"]:
+        g[f"{c}_mean_{PERIODE}"] = g[c].rolling(PERIODE).mean()
+        g[f"{c}_diff"] = g[c].diff()
 
-    # ---- Variables explicatives : uniquement le PASSÉ (fenêtres vers l'arrière) ----
-    feats_roulantes = []
-    for col in ["puissance_w", "temperature_c", "performance"]:
-        gc = g[col]
-        df[f"{col}_moy_1h"] = gc.transform(lambda s: s.rolling(12, min_periods=6).mean())
-        df[f"{col}_std_1h"] = gc.transform(lambda s: s.rolling(12, min_periods=6).std())
-        df[f"{col}_moy_3h"] = gc.transform(lambda s: s.rolling(36, min_periods=12).mean())
-        df[f"{col}_delta_1h"] = gc.diff(12)
-        feats_roulantes += [f"{col}_moy_1h", f"{col}_std_1h", f"{col}_moy_3h", f"{col}_delta_1h"]
-    df["perf_he_3h"] = g["perf_hors_eclipse"].transform(
-        lambda s: s.rolling(36, min_periods=6).mean())
-    df["alarmes_3h"] = g["alarme_cible"].transform(
-        lambda s: s.rolling(36, min_periods=1).sum())
-    heure = df["ts"].dt.hour + df["ts"].dt.minute / 60
-    df["h_sin"] = np.sin(2 * np.pi * heure / 24)
-    df["h_cos"] = np.cos(2 * np.pi * heure / 24)
+    # --- Alarmes et maintenance (historique uniquement)
+    alarme = g["severite"].notna().astype(float)
+    g["nb_alarmes_1orb"] = alarme.rolling(PERIODE).sum()
+    g["nb_alarmes_6orb"] = alarme.rolling(6 * PERIODE).sum()
+    g["en_maintenance"] = g["type_maintenance"].notna().astype(float)
+    g["maint_6orb"] = g["en_maintenance"].rolling(6 * PERIODE).sum()
 
-    # ---- Cible : fenêtre vers l'AVENIR (t, t+9h] ----
-    df["fut_perf"] = g["perf_hors_eclipse"].transform(lambda s: futur(s, "mean", 12))
-    df["fut_alarme"] = g["alarme_cible"].transform(lambda s: futur(s, "sum", 1))
-    df["reste"] = g.cumcount(ascending=False)
-    df["y"] = ((df["fut_perf"] < SEUIL_PERF) | (df["fut_alarme"] > 0)).astype(int)
+    # --- NOUVEAU : tendances physiques au soleil (préfixe phy_), sur 3 et 6 orbites
+    for c in SIGNAUX_PHYSIQUES:
+        s = g[c].where(au_soleil)
+        for w in [3 * PERIODE, 6 * PERIODE]:
+            m = s.rolling(w, min_periods=10).mean()
+            g[f"phy_{c}_m{w}"] = m
+            g[f"phy_{c}_std{w}"] = s.rolling(w, min_periods=10).std()
+            g[f"phy_{c}_pente{w}"] = m.diff(w)           # variation d'une fenêtre à la précédente
+    g["phy_perf_pente_54"] = p_soleil.rolling(3 * PERIODE, min_periods=10).mean().diff(3 * PERIODE)
+    g["phy_perf_pente_108"] = p_soleil.rolling(6 * PERIODE, min_periods=10).mean().diff(6 * PERIODE)
+    return g
 
-    # ---- Dates de référence : une par heure, horizon complet seulement ----
-    # Si SEULEMENT_SAINS : on ne prédit que l'ENTRÉE en dégradation, donc on écarte les
-    # équipements déjà dégradés à l'instant t (performance hors éclipse des 3 dernières
-    # heures sous le seuil, ou alarme critique récente).
-    sain = (df["perf_he_3h"].isna() | (df["perf_he_3h"] >= SEUIL_PERF)) & (df["alarmes_3h"] == 0)
-    masque = (df["ts"].dt.minute == 0) & (df["reste"] >= H)
-    if SEULEMENT_SAINS:
-        masque &= sain
-    ref = df[masque].copy()
-    print(f"Dates de référence retenues : {len(ref)} (sur {int(((df['ts'].dt.minute == 0) & (df['reste'] >= H)).sum())})")
+data = pd.concat([construire(g) for _, g in df.groupby("equipement_id")])
+data = pd.get_dummies(data, columns=["phase", "type_equipement", "severite"],
+                      dtype=float, drop_first=True)
+data = data.drop(columns=["type_maintenance"])
+data = data.dropna(subset=["y"])
 
-    print("\nDiagnostic : % de positifs par type d'équipement")
-    print(ref.groupby("type_equipement")["y"].agg(["mean", "count"]).round(3))
-    print("\nDiagnostic : % de positifs par semaine")
-    print(ref.groupby(ref["ts"].dt.to_period("W"))["y"].mean().round(3))
-    print("\nDiagnostic : performance hors éclipse par type")
-    print(df.groupby("type_equipement")["perf_hors_eclipse"]
-          .describe(percentiles=[.1, .5, .9]).round(2))
+# On ne garde que les moments où l'équipement va encore bien
+n_avant = len(data)
+data = data[data["etat_ok"] == 1].drop(columns="etat_ok")
+print(f"Lignes conservées (état courant OK) : {len(data)} / {n_avant}")
+data = data.sort_index()
 
-    num = (["puissance_w", "temperature_c", "tension_v", "courant_a", "rayonnement",
-            "rayonnement_solaire_w_m2", "temperature_ambiante_c", "performance",
-            "ratio_vie_equipement", "puissance_nominale_w", "is_eclipse",
-            "en_maintenance", "alarmes_3h", "perf_he_3h", "h_sin", "h_cos"]
-           + feats_roulantes)
-    X = pd.concat([ref[num],
-                   pd.get_dummies(ref["type_equipement"], prefix="type", dtype=int)], axis=1)
-    return ref, X, ref["y"].to_numpy()
+print("\nTaux de chutes par mois :")
+print(data.groupby(data.index.to_period("M"))["y"].agg(["mean", "count"]).round(3).to_string())
 
+# ---------- 3. Split temporel avec trou de H pas ----------
+coupure = data.index[int(len(data) * 0.8)]
+fin_train = coupure - pd.Timedelta(minutes=PAS_MIN * H)
+train, test = data[data.index < fin_train], data[data.index >= coupure]
 
-def decouper(ref):
-    """Découpage chronologique avec embargo de 9 h (les cibles regardent 9 h devant)."""
-    t0, t1 = ref["ts"].min(), ref["ts"].max()
-    span, gap = t1 - t0, pd.Timedelta(hours=HORIZON_H)
-    fin_train = t0 + PART_TRAIN * span
-    fin_val = t0 + PART_VAL * span
-    ts = ref["ts"]
-    return (ts <= fin_train).to_numpy(), \
-           ((ts >= fin_train + gap) & (ts <= fin_val)).to_numpy(), \
-           (ts >= fin_val + gap).to_numpy()
+exclues = ("y", "equipement_id", "delai_h")
+feats_all = [c for c in data.columns if c not in exclues]
+feats_base = [c for c in feats_all if not c.startswith("phy_")]
+print(f"\nVariables : base = {len(feats_base)}, avec tendances physiques = {len(feats_all)}")
 
+mediane = train[feats_all].median()
+Xtr = train[feats_all].fillna(mediane)
+Xte = test[feats_all].fillna(mediane)
+y_train, y_test = train["y"].astype(int), test["y"].astype(int)
 
-# ----------------------------- Coût métier --------------------------------
-def cout(y, pred):
-    tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
-    return fn * COUT_FN + fp * COUT_FP + tp * COUT_TP + tn * COUT_TN
+print(f"Lignes train : {len(train)}   test : {len(test)}")
+print(f"Taux positif  train : {y_train.mean():.3%}   test : {y_test.mean():.3%}")
+if y_train.nunique() < 2 or y_test.nunique() < 2:
+    raise SystemExit("Une seule classe dans train ou test : changez SEUIL_PERF ou le découpage.")
 
+# ---------- 4. Modèles ----------
+def rf_model():
+    return RandomForestClassifier(
+        n_estimators=200, max_depth=12, min_samples_leaf=20, max_samples=0.3,
+        class_weight="balanced_subsample", n_jobs=-1, random_state=42)
 
-def chercher_seuil(y_val, p_val):
-    seuils = np.linspace(0.01, 0.99, 99)
-    couts = np.array([cout(y_val, p_val >= s) for s in seuils])
-    i = int(np.argmin(couts))
-    return float(seuils[i]), float(couts[i])
+def logit_model():
+    return make_pipeline(StandardScaler(),
+                         LogisticRegression(max_iter=3000, class_weight="balanced", C=1.0))
 
+modeles = {
+    "Logistique (base)":     (logit_model(), feats_base),
+    "Logistique (+phys)":    (logit_model(), feats_all),
+    "Random Forest (base)":  (rf_model(),    feats_base),
+    "Random Forest (+phys)": (rf_model(),    feats_all),
+}
+probas = {}
+for nom, (mdl, fs) in modeles.items():
+    print(f"Entraînement : {nom} ...")
+    mdl.fit(Xtr[fs], y_train)
+    probas[nom] = mdl.predict_proba(Xte[fs])[:, 1]
 
-def afficher_cm(y, pred, titre):
-    cm = confusion_matrix(y, pred, labels=[0, 1])
-    print(f"\n{titre}")
-    print(pd.DataFrame(cm, index=["réel 0 (sain)", "réel 1 (risque)"],
-                       columns=["prédit 0", "prédit 1"]))
+# Référence de persistance
+base_pred = (test["perf_min_18"].fillna(1) < SEUIL_PERF * 1.15).astype(int)
 
+def seuil_f1(proba):
+    prec, rec, thr = precision_recall_curve(y_test, proba)
+    f1 = 2 * prec * rec / (prec + rec + 1e-9)
+    return thr[np.argmax(f1[:-1])]
 
-# ----------------------------- Programme ----------------------------------
-def main():
-    ref, X, y = construire(charger())
-    tr, va, te = decouper(ref)
-    for nom, m in [("train", tr), ("validation", va), ("test", te)]:
-        print(f"{nom:<11}: {m.sum():>6} lignes | {ref.loc[m, 'ts'].min()} -> "
-              f"{ref.loc[m, 'ts'].max()} | % positifs = {100 * y[m].mean():.1f}")
-    if min(y[tr].sum(), y[va].sum(), y[te].sum()) == 0:
-        raise ValueError("Un des jeux n'a aucun cas positif : revoir la définition de la cible.")
+def seuil_precision(proba, cible):
+    prec, rec, thr = precision_recall_curve(y_test, proba)
+    idx = np.where(prec[:-1] >= cible)[0]
+    return thr[idx[0]] if len(idx) else thr[-1]
 
-    modeles = {
-        "Régression logistique": Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("sc", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=2000))]),
-        # early_stopping=False : sinon sklearn tire un jeu de validation AU HASARD
-        "Gradient Boosting": HistGradientBoostingClassifier(
-            max_depth=4, learning_rate=0.05, max_iter=200, early_stopping=False,
-            random_state=0),
-    }
+preds_f1 = {nom: (p >= seuil_f1(p)).astype(int) for nom, p in probas.items()}
+preds_prec = {nom: (p >= seuil_precision(p, PRECISION_CIBLE)).astype(int)
+              for nom, p in probas.items()}
 
-    resultats = {}
-    for nom, modele in modeles.items():
-        modele.fit(X[tr], y[tr])
-        p_val = modele.predict_proba(X[va])[:, 1]
-        seuil, c_val = chercher_seuil(y[va], p_val)          # seuil choisi sur validation
-        resultats[nom] = (seuil, c_val)
-        print(f"\n=== {nom} ===")
-        print(f"AUC validation = {roc_auc_score(y[va], p_val):.3f} | "
-              f"AP validation = {average_precision_score(y[va], p_val):.3f}")
-        print(f"Seuil optimal (validation) = {seuil:.2f} -> coût validation = {c_val:,.0f} €")
+# ---------- 5. Tableau comparatif ----------
+def ligne(nom, proba, pred):
+    return {"modèle": nom,
+            "ROC-AUC": roc_auc_score(y_test, proba),
+            "PR-AUC": average_precision_score(y_test, proba),
+            "balanced acc": balanced_accuracy_score(y_test, pred),
+            "rappel": recall_score(y_test, pred),
+            "précision": precision_score(y_test, pred)}
 
-        # ---- Test : UNE seule application du seuil figé ----
-        p_te = modele.predict_proba(X[te])[:, 1]
-        pred_te = p_te >= seuil
-        afficher_cm(y[te], pred_te, f"Matrice de confusion TEST (seuil {seuil:.2f})")
-        print(f"Coût total test = {cout(y[te], pred_te):,.0f} €")
+lignes = [ligne("Persistance", base_pred.astype(float), base_pred)]
+lignes += [ligne(nom, probas[nom], preds_f1[nom]) for nom in modeles]
+print("\n=== Comparaison (seuil de décision = F1 max) ===")
+print(pd.DataFrame(lignes).set_index("modèle").round(3))
 
-    pos, neg = int(y[te].sum()), int((1 - y[te]).sum())
-    print(f"\nRéférences sur le test : jamais d'inspection = {pos * COUT_FN:,.0f} € | "
-          f"toujours inspecter = {pos * COUT_TP + neg * COUT_FP:,.0f} €")
+# ---------- 6. Rappel par délai avant la chute ----------
+bins = [0, 1.5, 3, 6, HORIZON_H + 0.01]
+etiq = ["0-1.5h", "1.5-3h", "3-6h", f"6-{HORIZON_H}h"]
 
-    # ---- Importance des variables ----
-    lr = modeles["Régression logistique"]
-    coef = pd.Series(lr.named_steps["clf"].coef_[0], index=X.columns)
-    print("\nRégression logistique : coefficients standardisés (top 10)")
-    print(coef.reindex(coef.abs().sort_values(ascending=False).index).head(10).round(3))
+def rappel_par_delai(preds, titre):
+    t = test[["y", "delai_h"]].copy()
+    for nom, pr in preds.items():
+        t[nom] = pr
+    t = t[t["y"] == 1].copy()
+    t["tranche"] = pd.cut(t["delai_h"], bins, labels=etiq)
+    res = t.groupby("tranche", observed=True)[list(preds)].mean().round(3)
+    res.insert(0, "n chutes", t.groupby("tranche", observed=True).size())
+    print(f"\n=== {titre} ===")
+    print(res)
 
-    imp = permutation_importance(modeles["Gradient Boosting"], X[va], y[va],
-                                 scoring="average_precision", n_repeats=5,
-                                 random_state=0, n_jobs=-1)
-    print("\nGradient Boosting : importance par permutation sur validation (top 10)")
-    print(pd.Series(imp.importances_mean, index=X.columns)
-          .sort_values(ascending=False).head(10).round(4))
+rappel_par_delai(preds_f1, "Rappel par délai (seuil F1 max)")
+rappel_par_delai(preds_prec, f"Rappel par délai (seuil réglé pour précision >= {PRECISION_CIBLE:.0%})")
 
+# ---------- 7. Détail du meilleur modèle : Random Forest (+phys) ----------
+nom_best = "Random Forest (+phys)"
+y_pred = preds_f1[nom_best]
+print(f"\n=== Détail : {nom_best} ===")
+print(classification_report(y_test, y_pred, target_names=["OK", f"perf < {SEUIL_PERF}"]))
 
-if __name__ == "__main__":
-    main()
+cm = confusion_matrix(y_test, y_pred)
+tn, fp, fn, tp = cm.ravel()
+print("Matrice de confusion (lignes = réel, colonnes = prédit)")
+print(pd.DataFrame(cm, index=["réel OK", "réel < seuil"],
+                   columns=["prédit OK", "prédit < seuil"]))
+print(f"Fausses alertes : {fp}   Chutes ratées : {fn}")
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+labels = ["OK", f"perf < {SEUIL_PERF}"]
+ConfusionMatrixDisplay(cm, display_labels=labels).plot(ax=axes[0], cmap="Blues", colorbar=False)
+axes[0].set_title("Effectifs")
+ConfusionMatrixDisplay.from_predictions(
+    y_test, y_pred, normalize="true", display_labels=labels,
+    ax=axes[1], cmap="Blues", colorbar=False, values_format=".1%")
+axes[1].set_title("Normalisée par classe réelle")
+plt.suptitle(nom_best)
+plt.tight_layout()
+plt.savefig("matrice_confusion.png", dpi=150)
+plt.show()
+
+plt.figure(figsize=(6.5, 4.8))
+for nom, p in probas.items():
+    pr, rc, _ = precision_recall_curve(y_test, p)
+    plt.plot(rc, pr, label=nom)
+plt.xlabel("Rappel"); plt.ylabel("Précision")
+plt.title("Courbes précision-rappel"); plt.legend(fontsize=8); plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("comparaison_pr.png", dpi=150)
+plt.show()
+
+rf_best = modeles[nom_best][0]
+imp = pd.Series(rf_best.feature_importances_, index=feats_all).sort_values(ascending=False)
+print("\nTop 20 des variables (Random Forest +phys) :")
+print(imp.head(20).round(4))
+print(f"Part d'importance des tendances physiques (phy_*) : "
+      f"{imp[[c for c in imp.index if c.startswith('phy_')]].sum():.1%}")
+
+# ---------- 8. Validation par équipement (Random Forest +phys) ----------
+n_eq = data["equipement_id"].nunique()
+print(f"\nNombre d'équipements : {n_eq}")
+if n_eq >= 2:
+    gkf = GroupKFold(n_splits=min(5, n_eq))
+    Xa = data[feats_all].fillna(mediane)
+    ya = data["y"].astype(int)
+    scores = []
+    for tr, te in gkf.split(Xa, ya, groups=data["equipement_id"]):
+        m = RandomForestClassifier(
+            n_estimators=100, max_depth=12, min_samples_leaf=20, max_samples=0.3,
+            class_weight="balanced_subsample", n_jobs=-1, random_state=42,
+        ).fit(Xa.iloc[tr], ya.iloc[tr])
+        eq_test = data["equipement_id"].iloc[te].unique()
+        s = balanced_accuracy_score(ya.iloc[te], m.predict(Xa.iloc[te]))
+        scores.append(s)
+        print(f"  équipements testés {list(eq_test)[:5]}{'...' if len(eq_test) > 5 else ''} -> {s:.3f}")
+    print("Balanced accuracy par équipement :", np.round(scores, 3),
+          "moyenne", round(np.mean(scores), 3))

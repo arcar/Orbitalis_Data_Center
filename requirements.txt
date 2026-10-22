@@ -1,3 +1,4 @@
 pandas==3.0.6
 duckdb==1.5.6
 scikit-learn
+matplotlib
