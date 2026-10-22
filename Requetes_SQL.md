@@ -123,11 +123,13 @@ ORDER BY fp.equipement_id, dt.temps_id;
 
 ## Comparer les performances pendant les phases d’ensoleillement et les phases d’éclipse sans considérer l’éclipse comme une panne.
 ```
-
+SELECT
+    fp.equipement_id,
+    fp.phase,
+    COUNT(*)                         AS nb_mesures,
+    ROUND(AVG(fp.puissance_w), 2)    AS puissance_moyenne_w
+FROM base_etoile.main.fait_production AS fp
+GROUP BY fp.equipement_id, fp.phase
+ORDER BY fp.equipement_id, fp.phase;
 ```
 
-## Quel est le coût estimé des pertes de production non anticipées sur la période disponible ?
-
-```
-
-```
