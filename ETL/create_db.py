@@ -120,22 +120,26 @@ def creer_db(df_equip, df_alarm, df_alarm_detail, df_temps,
 
     con.execute("""
     CREATE TABLE fait_production (
-        production_id             INTEGER PRIMARY KEY,
-        maintenance_id            BIGINT  REFERENCES dim_maintenance(maintenance_id),
-        temps_id                  BIGINT  REFERENCES dim_temps(temps_id),
-        alarme_id                 BIGINT  REFERENCES dim_alarme(alarme_id),
-        equipement_id             VARCHAR REFERENCES dim_equipement(equipement_id),
-        puissance_w               DECIMAL(15,2),
-        temperature_c             DECIMAL(15,2),
-        rayonnement               DECIMAL(15,2),
-        tension_v                 DECIMAL(15,2),
-        courant_a                 DECIMAL(15,2),
-        performance               DECIMAL(15,2),
-        perte_production          DECIMAL(15,2),
-        ratio_vie_equipement      DECIMAL(15,2),
-        phase                     VARCHAR,
-        rayonnement_solaire_w_m2  DECIMAL(15,2),
-        temperature_ambiante_c    DECIMAL(15,2)
+        production_id                   INTEGER PRIMARY KEY,
+        maintenance_corrective_id       BIGINT REFERENCES dim_maintenance(maintenance_id),
+        maintenance_calibration_id      BIGINT REFERENCES dim_maintenance(maintenance_id),
+        maintenance_inspection_id       BIGINT REFERENCES dim_maintenance(maintenance_id),
+        maintenance_preventive_id       BIGINT REFERENCES dim_maintenance(maintenance_id),
+        maintenance_remplacement_id     BIGINT REFERENCES dim_maintenance(maintenance_id),
+        temps_id                        BIGINT  REFERENCES dim_temps(temps_id),
+        alarme_id                       BIGINT  REFERENCES dim_alarme(alarme_id),
+        equipement_id                   VARCHAR REFERENCES dim_equipement(equipement_id),
+        puissance_w                     DECIMAL(15,2),
+        temperature_c                   DECIMAL(15,2),
+        rayonnement                     DECIMAL(15,2),
+        tension_v                       DECIMAL(15,2),
+        courant_a                       DECIMAL(15,2),
+        performance                     DECIMAL(15,2),
+        perte_production                DECIMAL(15,2),
+        ratio_vie_equipement            DECIMAL(15,2),
+        phase                           VARCHAR,
+        rayonnement_solaire_w_m2        DECIMAL(15,2),
+        temperature_ambiante_c          DECIMAL(15,2)
     )""")
 
     # ---------- Dimensions ----------
@@ -166,7 +170,8 @@ def creer_db(df_equip, df_alarm, df_alarm_detail, df_temps,
     # ---------- Faits ----------
     con.execute("""
     INSERT INTO fait_production (
-        production_id, maintenance_id, temps_id, alarme_id, equipement_id,
+        production_id, maintenance_corrective_id, maintenance_calibration_id, maintenance_inspection_id, maintenance_preventive_id, maintenance_remplacement_id, 
+        temps_id, alarme_id, equipement_id,
         puissance_w, temperature_c, rayonnement, tension_v, courant_a,
         performance, perte_production, ratio_vie_equipement,
         phase, rayonnement_solaire_w_m2, temperature_ambiante_c
@@ -187,12 +192,49 @@ def creer_db(df_equip, df_alarm, df_alarm_detail, df_temps,
     ),
     maint AS (
         SELECT m.equipement_id,
+               m.type_intervention AS type_maintenance,
                CAST(substr(m.date_debut, 1, 10) AS DATE) AS d_debut,
                CAST(substr(m.date_fin,   1, 10) AS DATE) AS d_fin,
                dm.maintenance_id
         FROM df_maint_detail m
         JOIN dim_maintenance dm
           ON dm.type_maintenance = m.type_intervention AND dm.duree = m.duree
+    ),
+    maint_par_mesure AS (
+        SELECT
+            po.ts,
+            po.equipement_id,
+
+            MAX(CASE
+                WHEN lower(mt.type_maintenance) = 'corrective'
+                THEN mt.maintenance_id
+            END) AS maintenance_corrective_id,
+
+            MAX(CASE
+                WHEN lower(mt.type_maintenance) = 'calibration'
+                THEN mt.maintenance_id
+            END) AS maintenance_calibration_id,
+
+            MAX(CASE
+                WHEN lower(mt.type_maintenance) = 'inspection'
+                THEN mt.maintenance_id
+            END) AS maintenance_inspection_id,
+
+            MAX(CASE
+                WHEN lower(mt.type_maintenance) = 'preventive'
+                THEN mt.maintenance_id
+            END) AS maintenance_preventive_id,
+
+            MAX(CASE
+                WHEN lower(mt.type_maintenance) = 'remplacement'
+                THEN mt.maintenance_id
+            END) AS maintenance_remplacement_id
+
+        FROM prod_orb po
+        LEFT JOIN maint mt
+            ON mt.equipement_id = po.equipement_id
+        AND CAST(po.ts AS DATE) BETWEEN mt.d_debut AND mt.d_fin
+        GROUP BY po.ts, po.equipement_id
     ),
     alarm AS (
         SELECT a.equipement_id,
@@ -208,7 +250,11 @@ def creer_db(df_equip, df_alarm, df_alarm_detail, df_temps,
     )
     SELECT
         row_number() OVER (ORDER BY po.ts, po.equipement_id),
-        mt.maintenance_id,
+        mp.maintenance_corrective_id,
+        mp.maintenance_calibration_id,
+        mp.maintenance_inspection_id,
+        mp.maintenance_preventive_id,
+        mp.maintenance_remplacement_id,
         CAST(strftime(po.ts, '%Y%m%d%H%M') AS BIGINT),
         al.alarme_id,
         po.equipement_id,
@@ -221,9 +267,8 @@ def creer_db(df_equip, df_alarm, df_alarm_detail, df_temps,
         po.phase, po.rayonnement_solaire_w_m2, po.temperature_ambiante_c
     FROM prod_orb po
     JOIN dim_equipement e ON e.equipement_id = po.equipement_id
-    LEFT JOIN maint mt
-      ON mt.equipement_id = po.equipement_id
-     AND CAST(po.ts AS DATE) BETWEEN mt.d_debut AND mt.d_fin
+    LEFT JOIN maint_par_mesure mp
+        ON mp.equipement_id = po.equipement_id AND mp.ts = po.ts
     LEFT JOIN alarm al
       ON al.equipement_id = po.equipement_id AND al.ts_b = po.ts
     """)
