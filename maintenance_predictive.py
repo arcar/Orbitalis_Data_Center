@@ -1,30 +1,53 @@
 import sys
+from collections import defaultdict
 from pathlib import Path
 import duckdb
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GroupKFold
-from sklearn.metrics import (average_precision_score, precision_recall_curve,
-                             classification_report, confusion_matrix,
-                             ConfusionMatrixDisplay, balanced_accuracy_score,
-                             roc_auc_score, precision_score, recall_score)
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 # ============================== CONFIG ==============================
 STAR_DB = (Path(sys.argv[1]) if len(sys.argv) > 1
            else Path(__file__).resolve().parent / "data" / "base_etoile.duckdb")
 
-PAS_MIN = 5                      # pas de la télémétrie (minutes)
-HORIZON_H = 9                    # horizon de prédiction (6 périodes orbitales de 90 min)
+PAS_MIN = 5
+HORIZON_H = 9
 H = HORIZON_H * 60 // PAS_MIN    # 108 pas
 PERIODE = 90 // PAS_MIN          # 18 pas par orbite
+JOUR = 24 * 60 // PAS_MIN        # 288 pas
 SEUIL_PERF = 0.45                # seuil sur la performance AU SOLEIL
-PHASE_SOLEIL = None              # None = détection auto ; sinon "ensoleillement"
-PRECISION_CIBLE = 0.90           # pour la comparaison à précision fixée
+PHASE_SOLEIL = None              # None = détection auto
+
+SILENCE_H = 9
+S = SILENCE_H * 60 // PAS_MIN
+
+COUT_FN = 2500                   # dégradation non anticipée
+COUT_FP = 150                    # inspection inutile
+COUT_TP = 300                    # dégradation correctement anticipée
+
+GAP_MIN = HORIZON_H * 60
+KINDS = ["corrective", "calibration", "inspection", "preventive", "remplacement"]
+CAP_DEPUIS = 10 * JOUR
+
+N_SEG = 8
+PREMIER_BLOC = 3
+N_PLIS_EQ = 5
+N_ARBRES = 200
+N_BOOT = 3000
+LISSAGE = 5
+
+RULES = {"Règle perf_min_18": "perf_min_18",
+         "Règle perf_min_54": "perf_min_54",
+         "Règle perf_min_108": "perf_min_108"}
+LR_FEATS = ["perf_min_108", "perf_min_18", "perf_mean_54", "perf_std_108", "ratio_vie"]
+REGLEE = "Règle réglée (fenêtre + seuil)"
+BASELINE = "Baseline (facteur 1.15, non réglée)"
+MODELES = [*RULES, "Logistique (5 var.)", "RF complet"]
 # ====================================================================
 
 # ---------- 1. Chargement ----------
@@ -47,29 +70,31 @@ df = con.execute("""
         e.puissance_nominale_w::DOUBLE     AS p_nominale,
         e.rendement_nominal::DOUBLE        AS rend_nominal,
         a.severite,
-        m.type_maintenance
+        CASE WHEN f.maintenance_corrective_id   IS NOT NULL THEN 1.0 ELSE 0.0 END AS m_corrective,
+        CASE WHEN f.maintenance_calibration_id  IS NOT NULL THEN 1.0 ELSE 0.0 END AS m_calibration,
+        CASE WHEN f.maintenance_inspection_id   IS NOT NULL THEN 1.0 ELSE 0.0 END AS m_inspection,
+        CASE WHEN f.maintenance_preventive_id   IS NOT NULL THEN 1.0 ELSE 0.0 END AS m_preventive,
+        CASE WHEN f.maintenance_remplacement_id IS NOT NULL THEN 1.0 ELSE 0.0 END AS m_remplacement,
+        (COALESCE(m_cor.duree, 0) + COALESCE(m_cal.duree, 0) + COALESCE(m_ins.duree, 0)
+         + COALESCE(m_pre.duree, 0) + COALESCE(m_rem.duree, 0))::DOUBLE            AS m_duree
     FROM fait_production f
     JOIN dim_temps t       ON t.temps_id = f.temps_id
     JOIN dim_equipement e  ON e.equipement_id = f.equipement_id
-    LEFT JOIN dim_alarme a      ON a.alarme_id = f.alarme_id
-    LEFT JOIN dim_maintenance m ON m.maintenance_id = f.maintenance_id
+    LEFT JOIN dim_alarme a          ON a.alarme_id = f.alarme_id
+    LEFT JOIN dim_maintenance m_cor ON m_cor.maintenance_id = f.maintenance_corrective_id
+    LEFT JOIN dim_maintenance m_cal ON m_cal.maintenance_id = f.maintenance_calibration_id
+    LEFT JOIN dim_maintenance m_ins ON m_ins.maintenance_id = f.maintenance_inspection_id
+    LEFT JOIN dim_maintenance m_pre ON m_pre.maintenance_id = f.maintenance_preventive_id
+    LEFT JOIN dim_maintenance m_rem ON m_rem.maintenance_id = f.maintenance_remplacement_id
     ORDER BY f.equipement_id, ts
 """).df()
 con.close()
 
-print("Phases et performance moyenne :")
-print(df.groupby("phase")["performance"].agg(["count", "mean", "median"]))
-
 if PHASE_SOLEIL is None:
     PHASE_SOLEIL = df.groupby("phase")["performance"].mean().idxmax()
-print(f"\nPhase ensoleillée retenue : {PHASE_SOLEIL!r}")
+print(f"Phase ensoleillée retenue : {PHASE_SOLEIL!r}")
 
-soleil = df[df["phase"] == PHASE_SOLEIL]["performance"]
-print("Performance au soleil :")
-print(soleil.describe())
-print(f"Part au soleil sous {SEUIL_PERF} : {(soleil < SEUIL_PERF).mean():.2%}\n")
-
-# ---------- 2. Cible + features, équipement par équipement ----------
+# ---------- 2. Épisodes, cible et variables ----------
 SIGNAUX_PHYSIQUES = ["temperature_c", "tension_v", "courant_a",
                      "puissance_w", "ray_solaire", "ecart_temp"]
 
@@ -77,20 +102,15 @@ def construire(g: pd.DataFrame) -> pd.DataFrame:
     g = g.sort_values("ts").drop_duplicates("ts").set_index("ts").copy()
     au_soleil = (g["phase"] == PHASE_SOLEIL)
     p = g["performance"]
-    p_soleil = p.where(au_soleil)                        # NaN pendant l'éclipse
+    p_soleil = p.where(au_soleil)
+    ps = p_soleil.ffill(limit=PERIODE)
 
-    # Cible : la perf au soleil passe sous le seuil au moins une fois dans les H prochains pas
-    futur_min = p_soleil[::-1].rolling(H, min_periods=1).min()[::-1].shift(-1)
-    g["y"] = (futur_min < SEUIL_PERF).astype(float)
-    g.loc[futur_min.isna(), "y"] = np.nan
+    sous = (p_soleil < SEUIL_PERF)
+    deja = sous.astype(float).shift(1).rolling(S, min_periods=S).max()
+    g["debut_evt"] = (sous & (deja == 0)).astype(float)
+    g["sain"] = ((deja == 0) & (ps >= SEUIL_PERF)).astype(float)
+    g["y"] = g["debut_evt"][::-1].rolling(H, min_periods=1).max()[::-1].shift(-1)
 
-    # Délai avant la prochaine chute (heures) : analyse uniquement, pas une variable du modèle
-    t_evt = pd.Series(g.index, index=g.index).where((p_soleil < SEUIL_PERF).values)
-    t_next = t_evt.shift(-1).bfill()
-    g["delai_h"] = (t_next - pd.Series(g.index, index=g.index)).dt.total_seconds() / 3600
-
-    # --- Historique de la performance au soleil
-    ps = p_soleil.ffill(limit=PERIODE)                   # dernière valeur solaire connue
     for lag in [1, 2, 3, PERIODE // 2, PERIODE, 2 * PERIODE, 6 * PERIODE]:
         g[f"perf_lag_{lag}"] = ps.shift(lag)
     for w in [PERIODE, 3 * PERIODE, 6 * PERIODE]:
@@ -100,199 +120,281 @@ def construire(g: pd.DataFrame) -> pd.DataFrame:
     g["perf_tendance"] = p_soleil.rolling(6 * PERIODE, min_periods=10).mean().diff(PERIODE)
     g["dist_seuil"] = ps - SEUIL_PERF
 
-    # État courant : dernière performance connue au soleil encore au-dessus du seuil
-    g["etat_ok"] = (ps >= SEUIL_PERF).astype(float)
-
-    # --- Signaux physiques instantanés (variables de base)
     g["ecart_temp"] = g["temperature_c"] - g["temp_amb"]
     for c in ["temperature_c", "tension_v", "courant_a", "puissance_w"]:
         g[f"{c}_mean_{PERIODE}"] = g[c].rolling(PERIODE).mean()
         g[f"{c}_diff"] = g[c].diff()
 
-    # --- Alarmes et maintenance (historique uniquement)
     alarme = g["severite"].notna().astype(float)
     g["nb_alarmes_1orb"] = alarme.rolling(PERIODE).sum()
     g["nb_alarmes_6orb"] = alarme.rolling(6 * PERIODE).sum()
-    g["en_maintenance"] = g["type_maintenance"].notna().astype(float)
-    g["maint_6orb"] = g["en_maintenance"].rolling(6 * PERIODE).sum()
 
-    # --- NOUVEAU : tendances physiques au soleil (préfixe phy_), sur 3 et 6 orbites
+    pos = np.arange(len(g))
+    for k in KINDS:
+        f = g[f"m_{k}"]
+        g[f"maint_{k}_6orb"] = f.rolling(6 * PERIODE, min_periods=1).sum()
+        g[f"maint_{k}_1j"] = f.rolling(JOUR, min_periods=1).sum()
+        dernier = pd.Series(np.where(f.values > 0, pos, np.nan), index=g.index).ffill()
+        g[f"depuis_maint_{k}"] = (pos - dernier).fillna(CAP_DEPUIS)
+    g["en_maintenance"] = (g[[f"m_{k}" for k in KINDS]].sum(axis=1) > 0).astype(float)
+    g["maint_duree_1j"] = g["m_duree"].rolling(JOUR, min_periods=1).sum()
+    g = g.drop(columns=[f"m_{k}" for k in KINDS] + ["m_duree"])
+
     for c in SIGNAUX_PHYSIQUES:
         s = g[c].where(au_soleil)
         for w in [3 * PERIODE, 6 * PERIODE]:
             m = s.rolling(w, min_periods=10).mean()
             g[f"phy_{c}_m{w}"] = m
             g[f"phy_{c}_std{w}"] = s.rolling(w, min_periods=10).std()
-            g[f"phy_{c}_pente{w}"] = m.diff(w)           # variation d'une fenêtre à la précédente
+            g[f"phy_{c}_pente{w}"] = m.diff(w)
     g["phy_perf_pente_54"] = p_soleil.rolling(3 * PERIODE, min_periods=10).mean().diff(3 * PERIODE)
     g["phy_perf_pente_108"] = p_soleil.rolling(6 * PERIODE, min_periods=10).mean().diff(6 * PERIODE)
     return g
 
 data = pd.concat([construire(g) for _, g in df.groupby("equipement_id")])
+
+EPOCH = pd.Timestamp("2000-01-01")
+def en_minutes(index):
+    return np.round(((pd.DatetimeIndex(index) - EPOCH) / pd.Timedelta(minutes=1)).to_numpy()).astype("int64")
+
+evts = data.loc[data["debut_evt"] == 1, ["equipement_id"]].copy()
+evts["t"] = en_minutes(evts.index)
+EV = {eq: np.sort(g["t"].to_numpy()) for eq, g in evts.groupby("equipement_id")}
+print(f"Épisodes (silence = {SILENCE_H} h) : {len(evts)} sur {data['equipement_id'].nunique()} équipements")
+
 data = pd.get_dummies(data, columns=["phase", "type_equipement", "severite"],
                       dtype=float, drop_first=True)
-data = data.drop(columns=["type_maintenance"])
 data = data.dropna(subset=["y"])
+data = data[data["sain"] == 1].drop(columns="sain").sort_index()
+print(f"Lignes éligibles : {len(data)}   positives : {int(data['y'].sum())} ({data['y'].mean():.2%})")
 
-# On ne garde que les moments où l'équipement va encore bien
-n_avant = len(data)
-data = data[data["etat_ok"] == 1].drop(columns="etat_ok")
-print(f"Lignes conservées (état courant OK) : {len(data)} / {n_avant}")
-data = data.sort_index()
+feats = [c for c in data.columns if c not in ("y", "equipement_id", "debut_evt")]
+TM = en_minutes(data.index)
+EQS = sorted(data["equipement_id"].unique())
+gap = pd.Timedelta(minutes=GAP_MIN)
 
-print("\nTaux de chutes par mois :")
-print(data.groupby(data.index.to_period("M"))["y"].agg(["mean", "count"]).round(3).to_string())
+# ---------- 3. Simulation du coût par épisode ----------
+def preparer(d, score, ev):
+    fr = pd.DataFrame({"eq": d["equipement_id"].values, "t": en_minutes(d.index), "p": np.asarray(score)})
+    fr = fr.sort_values(["eq", "t"])
+    groupes = {eq: (g["t"].to_numpy(), g["p"].to_numpy()) for eq, g in fr.groupby("eq")}
+    t_min, t_max = int(fr["t"].min()), int(fr["t"].max())
+    evp = {eq: a[(a >= t_min + GAP_MIN) & (a <= t_max)] for eq, a in ev.items() if eq in groupes}
+    return {"groupes": groupes, "ev": evp, "t_eval_fin": t_max - GAP_MIN}
 
-# ---------- 3. Split temporel avec trou de H pas ----------
-coupure = data.index[int(len(data) * 0.8)]
-fin_train = coupure - pd.Timedelta(minutes=PAS_MIN * H)
-train, test = data[data.index < fin_train], data[data.index >= coupure]
+def alertes(t_cand):
+    out, i, n = [], 0, len(t_cand)
+    while i < n:
+        out.append(t_cand[i])
+        i = int(np.searchsorted(t_cand, t_cand[i] + GAP_MIN, side="left"))
+    return np.array(out, dtype="int64")
 
-exclues = ("y", "equipement_id", "delai_h")
-feats_all = [c for c in data.columns if c not in exclues]
-feats_base = [c for c in feats_all if not c.startswith("phy_")]
-print(f"\nVariables : base = {len(feats_base)}, avec tendances physiques = {len(feats_all)}")
+def simuler(ctx, seuil):
+    tot = defaultdict(int); par_eq = {}; leads = []
+    for eq in set(ctx["groupes"]) | set(ctx["ev"]):
+        ons = ctx["ev"].get(eq, np.array([], dtype="int64"))
+        tp = fp = man = cov_n = 0
+        if eq in ctx["groupes"]:
+            t, p = ctx["groupes"][eq]
+            al = alertes(t[p >= seuil])
+        else:
+            al = np.array([], dtype="int64")
+        if len(al):
+            if len(ons):
+                i = np.searchsorted(ons, al, side="right")
+                est_tp = (i < len(ons)) & (ons[np.minimum(i, len(ons) - 1)] <= al + GAP_MIN)
+            else:
+                est_tp = np.zeros(len(al), dtype=bool)
+            tp = int(est_tp.sum())
+            fp = int((~est_tp & (al <= ctx["t_eval_fin"])).sum())
+        if len(ons):
+            if len(al):
+                j = np.searchsorted(al, ons - GAP_MIN, side="left")
+                cov = (j < len(al)) & (al[np.minimum(j, len(al) - 1)] < ons)
+                cov_n = int(cov.sum()); man = int((~cov).sum())
+                leads.extend((ons[cov] - al[j[cov]]).tolist())
+            else:
+                man = len(ons)
+        par_eq[eq] = tp * COUT_TP + fp * COUT_FP + man * COUT_FN
+        tot["tp"] += tp; tot["fp"] += fp; tot["manques"] += man; tot["couverts"] += cov_n
+    return {**tot, "par_eq": par_eq, "leads": leads}
 
-mediane = train[feats_all].median()
-Xtr = train[feats_all].fillna(mediane)
-Xte = test[feats_all].fillna(mediane)
-y_train, y_test = train["y"].astype(int), test["y"].astype(int)
+def res_jamais(ctx):
+    n = sum(len(a) for a in ctx["ev"].values())
+    return {"tp": 0, "fp": 0, "manques": n, "couverts": 0,
+            "par_eq": {eq: len(a) * COUT_FN for eq, a in ctx["ev"].items()}, "leads": []}
 
-print(f"Lignes train : {len(train)}   test : {len(test)}")
-print(f"Taux positif  train : {y_train.mean():.3%}   test : {y_test.mean():.3%}")
-if y_train.nunique() < 2 or y_test.nunique() < 2:
-    raise SystemExit("Une seule classe dans train ou test : changez SEUIL_PERF ou le découpage.")
+def res_oracle(ctx):
+    n = sum(len(a) for a in ctx["ev"].values())
+    return {"tp": n, "fp": 0, "manques": 0, "couverts": n,
+            "par_eq": {eq: len(a) * COUT_TP for eq, a in ctx["ev"].items()}, "leads": []}
+
+GRILLE = np.append(np.round(np.arange(0.01, 1.00, 0.01), 2), 1.01)   # 1.01 = ne jamais alerter
+
+def cout_total(ctx, s):
+    return sum(simuler(ctx, s)["par_eq"].values())
+
+def choisir_seuil(courbe):
+    """Seuil minimisant la courbe de coût lissée ; renvoie (seuil, coût de validation à ce seuil)."""
+    c = np.asarray(courbe, dtype=float)
+    sm = pd.Series(c[:-1]).rolling(LISSAGE, center=True, min_periods=1).mean().to_numpy()
+    c2 = np.append(sm, c[-1])                       # « ne jamais alerter » n'est pas lissé
+    i = int(np.argmin(c2))
+    return float(GRILLE[i]), float(c2[i])
 
 # ---------- 4. Modèles ----------
-def rf_model():
-    return RandomForestClassifier(
-        n_estimators=200, max_depth=12, min_samples_leaf=20, max_samples=0.3,
-        class_weight="balanced_subsample", n_jobs=-1, random_state=42)
+def run_modele(nom, tr_all, te):
+    cut_val = tr_all.index[int(len(tr_all) * 0.8)]
+    fit = tr_all[tr_all.index < cut_val - gap]
+    val = tr_all[tr_all.index >= cut_val]
+    if len(fit) == 0 or len(val) == 0:
+        return None
+    if nom in RULES:
+        col = RULES[nom]                              # score = 1 - perf_min : plus c'est haut, plus le risque est élevé
+        s_val = 1 - val[col].fillna(1).to_numpy()
+        s_te = 1 - te[col].fillna(1).to_numpy()
+    else:
+        if fit["y"].nunique() < 2:
+            return None
+        if nom.startswith("Logistique"):
+            fl = LR_FEATS
+            mdl = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, class_weight="balanced"))
+        else:
+            fl = feats
+            mdl = RandomForestClassifier(
+                n_estimators=N_ARBRES, max_depth=8, min_samples_leaf=50, max_samples=0.5,
+                class_weight="balanced_subsample", n_jobs=-1, random_state=42)
+        med = fit[fl].median()
+        mdl.fit(fit[fl].fillna(med), fit["y"].astype(int))
+        s_val = mdl.predict_proba(val[fl].fillna(med))[:, 1]
+        s_te = mdl.predict_proba(te[fl].fillna(med))[:, 1]
+    ctx_val = preparer(val, s_val, EV)
+    couts_val = np.array([cout_total(ctx_val, s) for s in GRILLE], dtype=float)
+    return {"couts_val": couts_val, "ctx_te": preparer(te, s_te, EV), "s_te": s_te}
 
-def logit_model():
-    return make_pipeline(StandardScaler(),
-                         LogisticRegression(max_iter=3000, class_weight="balanced", C=1.0))
+# ---------- 5. Agrégation ----------
+def nouvel_agg():
+    return {"tp": 0, "fp": 0, "manques": 0, "couverts": 0,
+            "leads": [], "par_eq": defaultdict(float)}
 
-modeles = {
-    "Logistique (base)":     (logit_model(), feats_base),
-    "Logistique (+phys)":    (logit_model(), feats_all),
-    "Random Forest (base)":  (rf_model(),    feats_base),
-    "Random Forest (+phys)": (rf_model(),    feats_all),
-}
-probas = {}
-for nom, (mdl, fs) in modeles.items():
-    print(f"Entraînement : {nom} ...")
-    mdl.fit(Xtr[fs], y_train)
-    probas[nom] = mdl.predict_proba(Xte[fs])[:, 1]
+def ajouter(agg, res):
+    for k in ("tp", "fp", "manques", "couverts"):
+        agg[k] += res[k]
+    agg["leads"].extend(res["leads"])
+    for eq, c in res["par_eq"].items():
+        agg["par_eq"][eq] += c
 
-# Référence de persistance
-base_pred = (test["perf_min_18"].fillna(1) < SEUIL_PERF * 1.15).astype(int)
+def evaluer_schema(nom_schema, plis, cumulatif):
+    noms = ["Jamais inspecter", "Inspection périodique (9 h)", BASELINE, *MODELES, REGLEE, "Oracle (parfait)"]
+    agg = {n: nouvel_agg() for n in noms}
+    hist = {n: [] for n in MODELES}
+    y_all = {n: [] for n in MODELES}; s_all = {n: [] for n in MODELES}
+    detail = []
+    for i, (tr_all, te) in enumerate(plis, 1):
+        if len(te) == 0 or len(tr_all) < 1000:
+            print(f"  pli {i} ignoré (données insuffisantes)"); continue
+        ctx0 = preparer(te, np.zeros(len(te)), EV)
+        r_jam = res_jamais(ctx0); n_ev = r_jam["manques"]
+        if n_ev == 0:
+            print(f"  pli {i} ignoré (aucun épisode évaluable)"); continue
+        outs = {nom: run_modele(nom, tr_all, te) for nom in MODELES}
+        if any(o is None for o in outs.values()):
+            print(f"  pli {i} ignoré (un modèle n'a pas pu être entraîné)"); continue
 
-def seuil_f1(proba):
-    prec, rec, thr = precision_recall_curve(y_test, proba)
-    f1 = 2 * prec * rec / (prec + rec + 1e-9)
-    return thr[np.argmax(f1[:-1])]
+        ajouter(agg["Jamais inspecter"], r_jam)
+        ajouter(agg["Oracle (parfait)"], res_oracle(ctx0))
+        ajouter(agg["Inspection périodique (9 h)"], simuler(ctx0, 0.0))
+        base = (te["perf_min_108"].fillna(1) < SEUIL_PERF * 1.15).astype(float).to_numpy()
+        r_base = simuler(preparer(te, base, EV), 0.5)
+        ajouter(agg[BASELINE], r_base)
+        ligne = {"pli": i, "épisodes": n_ev,
+                 "jamais (€)": sum(r_jam["par_eq"].values()),
+                 BASELINE.split(" (")[0] + " (€)": sum(r_base["par_eq"].values())}
 
-def seuil_precision(proba, cible):
-    prec, rec, thr = precision_recall_curve(y_test, proba)
-    idx = np.where(prec[:-1] >= cible)[0]
-    return thr[idx[0]] if len(idx) else thr[-1]
+        for nom, out in outs.items():
+            hist[nom].append(out["couts_val"])
+            courbe = np.sum(hist[nom], axis=0) if cumulatif else out["couts_val"]
+            out["seuil"], out["cout_val"] = choisir_seuil(courbe)
+            res = simuler(out["ctx_te"], out["seuil"])
+            ajouter(agg[nom], res)
+            ligne[f"{nom} (€)"] = sum(res["par_eq"].values())
+            y_all[nom].append(te["y"].astype(int).to_numpy()); s_all[nom].append(out["s_te"])
 
-preds_f1 = {nom: (p >= seuil_f1(p)).astype(int) for nom, p in probas.items()}
-preds_prec = {nom: (p >= seuil_precision(p, PRECISION_CIBLE)).astype(int)
-              for nom, p in probas.items()}
+        # Règle réglée : la fenêtre est choisie sur la validation (coût de validation le plus bas)
+        meilleure = min(RULES, key=lambda n: outs[n]["cout_val"])
+        res = simuler(outs[meilleure]["ctx_te"], outs[meilleure]["seuil"])
+        ajouter(agg[REGLEE], res)
+        ligne[REGLEE.split(" (")[0] + " (€)"] = sum(res["par_eq"].values())
+        ligne["fenêtre choisie"] = RULES[meilleure]
+        ligne["seuil règle"] = outs[meilleure]["seuil"]
+        detail.append(ligne)
+        print(f"  pli {i} terminé ({n_ev} épisodes)")
 
-# ---------- 5. Tableau comparatif ----------
-def ligne(nom, proba, pred):
-    return {"modèle": nom,
-            "ROC-AUC": roc_auc_score(y_test, proba),
-            "PR-AUC": average_precision_score(y_test, proba),
-            "balanced acc": balanced_accuracy_score(y_test, pred),
-            "rappel": recall_score(y_test, pred),
-            "précision": precision_score(y_test, pred)}
+    print(f"\n--- Détail par pli : {nom_schema} ---")
+    print(pd.DataFrame(detail).round(2).to_string(index=False))
+    aucs = {}
+    for nom in MODELES:
+        if y_all[nom]:
+            y, s = np.concatenate(y_all[nom]), np.concatenate(s_all[nom])
+            aucs[nom] = (roc_auc_score(y, s), average_precision_score(y, s))
+    return agg, aucs
 
-lignes = [ligne("Persistance", base_pred.astype(float), base_pred)]
-lignes += [ligne(nom, probas[nom], preds_f1[nom]) for nom in modeles]
-print("\n=== Comparaison (seuil de décision = F1 max) ===")
-print(pd.DataFrame(lignes).set_index("modèle").round(3))
+def tableau(agg):
+    c_jam = sum(agg["Jamais inspecter"]["par_eq"].values())
+    lignes = []
+    for nom, a in agg.items():
+        cout = sum(a["par_eq"].values()); n_ev = a["couverts"] + a["manques"]
+        lignes.append({
+            "stratégie": nom, "coût total (€)": cout,
+            "économie vs jamais (%)": (1 - cout / c_jam) * 100 if c_jam else np.nan,
+            "alertes OK": a["tp"], "fausses alertes": a["fp"], "manqués": a["manques"],
+            "rappel": a["couverts"] / n_ev if n_ev else np.nan,
+            "précision": a["tp"] / (a["tp"] + a["fp"]) if (a["tp"] + a["fp"]) else np.nan,
+            "anticip. méd. (h)": np.median(a["leads"]) / 60 if a["leads"] else np.nan})
+    return pd.DataFrame(lignes).set_index("stratégie")
 
-# ---------- 6. Rappel par délai avant la chute ----------
-bins = [0, 1.5, 3, 6, HORIZON_H + 0.01]
-etiq = ["0-1.5h", "1.5-3h", "3-6h", f"6-{HORIZON_H}h"]
+def bootstrap(agg):
+    rng = np.random.default_rng(0)
+    vec = {n: np.array([a["par_eq"].get(eq, 0.0) for eq in EQS]) for n, a in agg.items()}
+    idx = rng.integers(0, len(EQS), size=(N_BOOT, len(EQS)))
+    paires = [(REGLEE, "Jamais inspecter"), (REGLEE, BASELINE),
+              ("Logistique (5 var.)", REGLEE), ("RF complet", REGLEE),
+              ("Logistique (5 var.)", "RF complet")]
+    print("\nÉcarts de coût (A − B), IC95 % par bootstrap sur les équipements (négatif = A moins cher) :")
+    for a, b in paires:
+        diff = vec[a][idx].sum(axis=1) - vec[b][idx].sum(axis=1)
+        lo, hi = np.percentile(diff, [2.5, 97.5])
+        print(f"  {a}  −  {b}\n      moyenne {diff.mean():+,.0f} €   IC95 [{lo:+,.0f} ; {hi:+,.0f}] €   "
+              f"A moins cher dans {np.mean(diff < 0):.0%} des tirages")
 
-def rappel_par_delai(preds, titre):
-    t = test[["y", "delai_h"]].copy()
-    for nom, pr in preds.items():
-        t[nom] = pr
-    t = t[t["y"] == 1].copy()
-    t["tranche"] = pd.cut(t["delai_h"], bins, labels=etiq)
-    res = t.groupby("tranche", observed=True)[list(preds)].mean().round(3)
-    res.insert(0, "n chutes", t.groupby("tranche", observed=True).size())
-    print(f"\n=== {titre} ===")
-    print(res)
+pd.set_option("display.width", 260); pd.set_option("display.max_columns", 40)
 
-rappel_par_delai(preds_f1, "Rappel par délai (seuil F1 max)")
-rappel_par_delai(preds_prec, f"Rappel par délai (seuil réglé pour précision >= {PRECISION_CIBLE:.0%})")
+# ---------- 6A. Validation temporelle en blocs ----------
+print("\n================ VALIDATION TEMPORELLE EN BLOCS ================")
+bornes = np.linspace(TM.min(), TM.max(), N_SEG + 1)
+plis_t = []
+for k in range(PREMIER_BLOC, N_SEG):
+    lo, hi = bornes[k], bornes[k + 1]
+    masque_te = (TM >= lo) & ((TM < hi) if k < N_SEG - 1 else (TM <= hi))
+    plis_t.append((data[TM < lo - GAP_MIN], data[masque_te]))
+agg_t, auc_t = evaluer_schema("blocs temporels (seuil cumulatif lissé)", plis_t, cumulatif=True)
+print("\n=== Total sur tous les blocs de test ===")
+print(tableau(agg_t).round(3).to_string())
+print("\nPouvoir de classement (toutes lignes saines) :")
+for nom, (roc, pr) in auc_t.items():
+    print(f"  {nom:<26} ROC-AUC {roc:.3f}   PR-AUC {pr:.3f}")
+bootstrap(agg_t)
 
-# ---------- 7. Détail du meilleur modèle : Random Forest (+phys) ----------
-nom_best = "Random Forest (+phys)"
-y_pred = preds_f1[nom_best]
-print(f"\n=== Détail : {nom_best} ===")
-print(classification_report(y_test, y_pred, target_names=["OK", f"perf < {SEUIL_PERF}"]))
+# ---------- 6B. Validation par équipement ----------
+print("\n================ VALIDATION PAR ÉQUIPEMENT (équipements jamais vus) ================")
+gkf = GroupKFold(n_splits=min(N_PLIS_EQ, len(EQS)))
+plis_e = [(data.iloc[a], data.iloc[b]) for a, b in gkf.split(data, groups=data["equipement_id"])]
+agg_e, auc_e = evaluer_schema("par équipement (seuil du pli lissé)", plis_e, cumulatif=False)
+print("\n=== Total sur tous les plis ===")
+print(tableau(agg_e).round(3).to_string())
+print("\nPouvoir de classement (toutes lignes saines) :")
+for nom, (roc, pr) in auc_e.items():
+    print(f"  {nom:<26} ROC-AUC {roc:.3f}   PR-AUC {pr:.3f}")
+bootstrap(agg_e)
 
-cm = confusion_matrix(y_test, y_pred)
-tn, fp, fn, tp = cm.ravel()
-print("Matrice de confusion (lignes = réel, colonnes = prédit)")
-print(pd.DataFrame(cm, index=["réel OK", "réel < seuil"],
-                   columns=["prédit OK", "prédit < seuil"]))
-print(f"Fausses alertes : {fp}   Chutes ratées : {fn}")
-
-fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-labels = ["OK", f"perf < {SEUIL_PERF}"]
-ConfusionMatrixDisplay(cm, display_labels=labels).plot(ax=axes[0], cmap="Blues", colorbar=False)
-axes[0].set_title("Effectifs")
-ConfusionMatrixDisplay.from_predictions(
-    y_test, y_pred, normalize="true", display_labels=labels,
-    ax=axes[1], cmap="Blues", colorbar=False, values_format=".1%")
-axes[1].set_title("Normalisée par classe réelle")
-plt.suptitle(nom_best)
-plt.tight_layout()
-plt.savefig("matrice_confusion.png", dpi=150)
-plt.show()
-
-plt.figure(figsize=(6.5, 4.8))
-for nom, p in probas.items():
-    pr, rc, _ = precision_recall_curve(y_test, p)
-    plt.plot(rc, pr, label=nom)
-plt.xlabel("Rappel"); plt.ylabel("Précision")
-plt.title("Courbes précision-rappel"); plt.legend(fontsize=8); plt.grid(alpha=0.3)
-plt.tight_layout()
-plt.savefig("comparaison_pr.png", dpi=150)
-plt.show()
-
-rf_best = modeles[nom_best][0]
-imp = pd.Series(rf_best.feature_importances_, index=feats_all).sort_values(ascending=False)
-print("\nTop 20 des variables (Random Forest +phys) :")
-print(imp.head(20).round(4))
-print(f"Part d'importance des tendances physiques (phy_*) : "
-      f"{imp[[c for c in imp.index if c.startswith('phy_')]].sum():.1%}")
-
-# ---------- 8. Validation par équipement (Random Forest +phys) ----------
-n_eq = data["equipement_id"].nunique()
-print(f"\nNombre d'équipements : {n_eq}")
-if n_eq >= 2:
-    gkf = GroupKFold(n_splits=min(5, n_eq))
-    Xa = data[feats_all].fillna(mediane)
-    ya = data["y"].astype(int)
-    scores = []
-    for tr, te in gkf.split(Xa, ya, groups=data["equipement_id"]):
-        m = RandomForestClassifier(
-            n_estimators=100, max_depth=12, min_samples_leaf=20, max_samples=0.3,
-            class_weight="balanced_subsample", n_jobs=-1, random_state=42,
-        ).fit(Xa.iloc[tr], ya.iloc[tr])
-        eq_test = data["equipement_id"].iloc[te].unique()
-        s = balanced_accuracy_score(ya.iloc[te], m.predict(Xa.iloc[te]))
-        scores.append(s)
-        print(f"  équipements testés {list(eq_test)[:5]}{'...' if len(eq_test) > 5 else ''} -> {s:.3f}")
-    print("Balanced accuracy par équipement :", np.round(scores, 3),
-          "moyenne", round(np.mean(scores), 3))
+print("\nLecture : un modèle est préférable à un autre seulement si l'IC95 de leur écart de coût ne contient pas 0.")
